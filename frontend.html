@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Historical FAQ Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#1e40af',
+                        secondary: '#3b82f6',
+                        neutral: '#f3f4f6',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                    },
+                },
+            }
+        }
+    </script>
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .content-auto {
+                content-visibility: auto;
+            }
+            .text-shadow {
+                text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            }
+            .transition-all-300 {
+                transition: all 300ms ease-in-out;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen flex flex-col">
+    <!-- Header -->
+    <header class="bg-primary text-white shadow-md">
+        <div class="container mx-auto px-4 py-4 flex justify-between items-center">
+            <div class="flex items-center space-x-3">
+                <i class="fa fa-history text-2xl"></i>
+                <h1 class="text-xl font-bold">Historical FAQ Bot</h1>
+            </div>
+            <div class="flex items-center space-x-4">
+                <button id="health-check" class="bg-white text-primary px-4 py-2 rounded-md hover:bg-gray-100 transition-all-300">
+                    <i class="fa fa-heartbeat mr-2"></i>健康检查
+                </button>
+                <button id="info-btn" class="bg-white text-primary px-4 py-2 rounded-md hover:bg-gray-100 transition-all-300">
+                    <i class="fa fa-info-circle mr-2"></i>关于
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1 container mx-auto px-4 py-8">
+        <div class="max-w-4xl mx-auto">
+            <!-- Search Form -->
+            <div class="bg-white rounded-lg shadow-lg p-6 mb-8">
+                <h2 class="text-2xl font-bold mb-4 text-gray-800">历史问答查询</h2>
+                <form id="search-form" class="flex flex-col space-y-4">
+                    <div class="relative">
+                        <input type="text" id="question" placeholder="请输入您的问题，例如：王洪文的生平..." 
+                               class="w-full px-4 py-3 rounded-lg border border-gray-300 focus:outline-none focus:ring-2 focus:ring-secondary focus:border-transparent">
+                        <div class="absolute right-2 top-1/2 transform -translate-y-1/2 flex space-x-2">
+                            <button type="submit" name="query_type" value="normal" class="bg-secondary text-white px-4 py-2 rounded-lg hover:bg-primary transition-all-300">
+                                <i class="fa fa-search mr-2"></i>普通查询
+                            </button>
+                            <button type="submit" name="query_type" value="agent" class="bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition-all-300">
+                                <i class="fa fa-robot mr-2"></i>智能查询
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Chat History -->
+            <div id="chat-history" class="bg-white rounded-lg shadow-lg p-6 mb-8">
+                <h3 class="text-xl font-bold mb-4 text-gray-800">对话历史</h3>
+                <div id="history-container" class="space-y-4 max-h-96 overflow-y-auto">
+                    <!-- History messages will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Results -->
+            <div id="results" class="bg-white rounded-lg shadow-lg p-6 hidden">
+                <h3 class="text-xl font-bold mb-4 text-gray-800">查询结果</h3>
+                <div id="results-container" class="space-y-6">
+                    <!-- Results will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Health Check Result -->
+            <div id="health-result" class="bg-white rounded-lg shadow-lg p-6 mt-8 hidden">
+                <h3 class="text-xl font-bold mb-4 text-gray-800">健康状态</h3>
+                <div id="health-info" class="space-y-2">
+                    <!-- Health info will be inserted here -->
+                </div>
+            </div>
+
+            <!-- Info Result -->
+            <div id="info-result" class="bg-white rounded-lg shadow-lg p-6 mt-8 hidden">
+                <h3 class="text-xl font-bold mb-4 text-gray-800">关于系统</h3>
+                <div id="info-content" class="space-y-4">
+                    <!-- Info content will be inserted here -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-800 text-white py-4">
+        <div class="container mx-auto px-4 text-center">
+            <p>Historical FAQ Bot © 2026</p>
+        </div>
+    </footer>
+
+    <script>
+        // API Endpoint
+        const API_URL = 'http://localhost:8000';
+
+        // DOM Elements
+        const searchForm = document.getElementById('search-form');
+        const questionInput = document.getElementById('question');
+        const resultsDiv = document.getElementById('results');
+        const resultsContainer = document.getElementById('results-container');
+        const healthCheckBtn = document.getElementById('health-check');
+        const healthResultDiv = document.getElementById('health-result');
+        const healthInfoDiv = document.getElementById('health-info');
+        const infoBtn = document.getElementById('info-btn');
+        const infoResultDiv = document.getElementById('info-result');
+        const infoContentDiv = document.getElementById('info-content');
+        const historyContainer = document.getElementById('history-container');
+
+        // Chat history
+        let chatHistory = [];
+
+        // Search Form Submission
+        searchForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const question = questionInput.value.trim();
+            
+            if (!question) {
+                alert('请输入问题');
+                return;
+            }
+
+            // Get query type
+            const queryType = e.submitter.value;
+
+            // Add user message to history
+            addMessageToHistory('user', question);
+
+            // Show loading state
+            resultsContainer.innerHTML = '<div class="flex justify-center py-8"><i class="fa fa-spinner fa-spin text-4xl text-secondary"></i></div>';
+            resultsDiv.classList.remove('hidden');
+
+            try {
+                let response, data;
+                
+                if (queryType === 'agent') {
+                    // Agent query
+                    response = await fetch(`${API_URL}/api/agent`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ question })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('API 请求失败');
+                    }
+                    
+                    data = await response.json();
+                    // Display agent results
+                    resultsContainer.innerHTML = `
+                        <div class="border border-gray-200 rounded-lg p-6 mb-6">
+                            <h4 class="text-lg font-bold mb-2">智能回答</h4>
+                            <p class="text-gray-700">${data.answer}</p>
+                            <div class="mt-4 flex justify-between items-center">
+                                <span class="text-sm bg-purple-100 text-purple-800 px-3 py-1 rounded-full">
+                                    智能查询
+                                </span>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    // Normal query
+                    response = await fetch(`${API_URL}/api/query`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ 
+                            question, 
+                            history: chatHistory 
+                        })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error('API 请求失败');
+                    }
+
+                    data = await response.json();
+                    displayResults(data);
+                }
+                
+                // Add bot message to history
+                addMessageToHistory('bot', data.answer);
+                
+                // Update chat history
+                chatHistory.push({ role: 'user', content: question });
+                chatHistory.push({ role: 'assistant', content: data.answer });
+                
+                // Clear input
+                questionInput.value = '';
+            } catch (error) {
+                resultsContainer.innerHTML = `<div class="text-center py-8 text-red-500">
+                    <i class="fa fa-exclamation-circle text-4xl mb-4"></i>
+                    <p>查询失败: ${error.message}</p>
+                </div>`;
+            }
+        });
+
+        // Health Check
+        healthCheckBtn.addEventListener('click', async () => {
+            try {
+                const response = await fetch(`${API_URL}/api/health`);
+                const data = await response.json();
+                
+                healthInfoDiv.innerHTML = `
+                    <div class="flex items-center space-x-2">
+                        <i class="fa fa-check-circle text-green-500 text-xl"></i>
+                        <span>状态: ${data.status}</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <i class="fa fa-server text-blue-500 text-xl"></i>
+                        <span>服务: ${data.service}</span>
+                    </div>
+                `;
+                healthResultDiv.classList.remove('hidden');
+                infoResultDiv.classList.add('hidden');
+            } catch (error) {
+                healthInfoDiv.innerHTML = `
+                    <div class="flex items-center space-x-2 text-red-500">
+                        <i class="fa fa-exclamation-circle text-xl"></i>
+                        <span>健康检查失败: ${error.message}</span>
+                    </div>
+                `;
+                healthResultDiv.classList.remove('hidden');
+                infoResultDiv.classList.add('hidden');
+            }
+        });
+
+        // Info Button
+        infoBtn.addEventListener('click', async () => {
+            try {
+                const response = await fetch(`${API_URL}/api/info`);
+                const data = await response.json();
+                
+                infoContentDiv.innerHTML = `
+                    <div class="space-y-2">
+                        <div class="flex items-center space-x-2">
+                            <i class="fa fa-name text-blue-500 text-xl"></i>
+                            <span class="font-bold">名称:</span>
+                            <span>${data.name}</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <i class="fa fa-version text-blue-500 text-xl"></i>
+                            <span class="font-bold">版本:</span>
+                            <span>${data.version}</span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                            <i class="fa fa-description text-blue-500 text-xl"></i>
+                            <span class="font-bold">描述:</span>
+                            <span>${data.description}</span>
+                        </div>
+                        <div class="mt-4">
+                            <span class="font-bold">功能:</span>
+                            <ul class="list-disc list-inside mt-2 space-y-1">
+                                ${data.features.map(feature => `<li>${feature}</li>`).join('')}
+                            </ul>
+                        </div>
+                    </div>
+                `;
+                infoResultDiv.classList.remove('hidden');
+                healthResultDiv.classList.add('hidden');
+            } catch (error) {
+                infoContentDiv.innerHTML = `
+                    <div class="flex items-center space-x-2 text-red-500">
+                        <i class="fa fa-exclamation-circle text-xl"></i>
+                        <span>获取信息失败: ${error.message}</span>
+                    </div>
+                `;
+                infoResultDiv.classList.remove('hidden');
+                healthResultDiv.classList.add('hidden');
+            }
+        });
+
+        // Display Results
+        function displayResults(data) {
+            if (!data.answer) {
+                resultsContainer.innerHTML = `<div class="text-center py-8 text-gray-500">
+                    <i class="fa fa-search-minus text-4xl mb-4"></i>
+                    <p>未找到相关内容</p>
+                </div>`;
+                return;
+            }
+
+            resultsContainer.innerHTML = `
+                <div class="border border-gray-200 rounded-lg p-6 mb-6">
+                    <h4 class="text-lg font-bold mb-2">回答</h4>
+                    <p class="text-gray-700">${data.answer}</p>
+                    <div class="mt-4 flex justify-between items-center">
+                        <span class="text-sm bg-blue-100 text-blue-800 px-3 py-1 rounded-full">
+                            检索类型: ${data.search_type}
+                        </span>
+                        <span class="text-sm bg-green-100 text-green-800 px-3 py-1 rounded-full">
+                            置信度: ${data.confidence.toFixed(4)}
+                        </span>
+                    </div>
+                </div>
+                <div class="border border-gray-200 rounded-lg p-6">
+                    <h4 class="text-lg font-bold mb-4">参考来源</h4>
+                    ${data.sources.length > 0 ? 
+                        data.sources.map((source, index) => `
+                            <div class="border-b border-gray-100 pb-3 mb-3 last:border-0 last:pb-0 last:mb-0">
+                                <div class="flex justify-between items-start">
+                                    <span class="font-medium">${source.type === 'faq' ? 'FAQ' : '文档'}</span>
+                                    ${source.confidence ? `<span class="text-sm text-gray-500">置信度: ${source.confidence.toFixed(4)}</span>` : ''}
+                                </div>
+                                ${source.question ? `<p class="text-gray-700 mt-1">${source.question}</p>` : ''}
+                                ${source.source ? `<p class="text-gray-600 text-sm mt-1">来源: ${source.source}${source.page ? ` (第${source.page}页)` : ''}</p>` : ''}
+                            </div>
+                        `).join('') 
+                        : '<p class="text-gray-500">无参考来源</p>'
+                    }
+                </div>
+            `;
+        }
+
+        // Add message to history
+        function addMessageToHistory(role, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `flex ${role === 'user' ? 'justify-end' : 'justify-start'} mb-4`;
+            messageDiv.innerHTML = `
+                <div class="max-w-[80%] ${role === 'user' ? 'bg-primary text-white' : 'bg-gray-100 text-gray-800'} rounded-lg p-4 shadow-sm">
+                    <p>${content}</p>
+                    <div class="text-xs mt-2 text-opacity-75">
+                        ${role === 'user' ? '我' : '系统'} · ${new Date().toLocaleTimeString()}
+                    </div>
+                </div>
+            `;
+            historyContainer.appendChild(messageDiv);
+            historyContainer.scrollTop = historyContainer.scrollHeight;
+        }
+
+        // Auto-resize input
+        questionInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+        });
+
+        // Initialize
+        window.onload = function() {
+            // Check health on load
+            fetch(`${API_URL}/api/health`)
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Health check:', data);
+                })
+                .catch(error => {
+                    console.log('Health check failed:', error);
+                });
+        };
+    </script>
+</body>
+</html>

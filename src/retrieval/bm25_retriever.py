@@ -1,0 +1,250 @@
+# -*- coding: utf-8 -*-
+"""
+BM25 检索器（Python 实现）
+
+使用 rank-bm25 库实现独立的 BM25 全文检索，不依赖数据库扩展。
+适用于关键词匹配场景，如人名、地名、专有名词检索。
+
+技术原理：
+BM25（Best Matching 25）是一种基于概率的全文检索算法，
+通过计算词频（TF）和逆文档频率（IDF）来评估文档相关性。
+
+优势：
+1. 关键词精确匹配（优于向量检索）
+2. 可解释性强（匹配词可见）
+3. 计算速度快（无需向量计算）
+4. 独立于数据库（纯 Python 实现）
+
+劣势：
+1. 无法处理语义相似（"李世民" vs "唐太宗"）
+2. 需要分词（中文需要额外处理）
+3. 内存占用（需要加载全部文档）
+"""
+
+import logging
+from typing import List, Dict, Any
+from dataclasses import dataclass
+from rank_bm25 import BM25Okapi
+import jieba  # 中文分词
+
+from src.vectorstore.pg_pool import get_connection
+from config.pg_config import PG_DOC_TABLE
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BM25Result:
+    """BM25 检索结果"""
+    id: int
+    content: str          # 文档片段内容
+    doc_name: str         # 来源文档名
+    doc_page: int         # 页码
+    chunk_index: int      # 片段序号
+    score: float          # BM25 打分
+    category: str = "bm25"
+
+
+class BM25Retriever:
+    """
+    BM25 检索器
+    
+    特点：
+    1. 适合关键词查询（人名、地名、专有名词）
+    2. 可与向量检索互补（混合检索）
+    3. 独立于数据库，纯 Python 实现
+    """
+    
+    def __init__(self, top_k: int = 10):
+        """
+        初始化 BM25 检索器
+        
+        Args:
+            top_k: 返回结果数量
+        """
+        self.top_k = top_k
+        self.bm25: BM25Okapi = None
+        self.documents: List[Dict[str, Any]] = []
+        self.tokenized_docs: List[List[str]] = []
+        self._load_documents()
+    
+    def _load_documents(self):
+        """
+        从数据库加载文档并构建 BM25 索引
+        
+        流程：
+        1. 从 PostgreSQL 读取所有文档片段
+        2. 使用 jieba 分词
+        3. 构建 BM25 索引（内存中）
+        """
+        logger.info("开始加载文档并构建 BM25 索引...")
+        
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT id, chunk_text, doc_name, doc_page, chunk_index
+                FROM {PG_DOC_TABLE}
+                ORDER BY id
+            """)
+            
+            self.documents = [
+                {
+                    "id": row[0],
+                    "content": row[1],
+                    "doc_name": row[2],
+                    "doc_page": row[3] if row[3] is not None else 0,
+                    "chunk_index": row[4] if row[4] is not None else 0
+                }
+                for row in cursor.fetchall()
+            ]
+            
+            cursor.close()
+        
+        # 中文分词（使用 jieba）
+        self.tokenized_docs = [
+            list(jieba.cut(doc["content"])) 
+            for doc in self.documents
+        ]
+        
+        # 构建 BM25 索引
+        self.bm25 = BM25Okapi(self.tokenized_docs)
+        
+        logger.info(f"BM25 索引构建完成：{len(self.documents)} 个文档，{sum(len(t) for t in self.tokenized_docs)} 个词")
+    
+    def retrieve(self, query: str) -> List[BM25Result]:
+        """
+        BM25 检索
+        
+        Args:
+            query: 用户查询
+        
+        Returns:
+            BM25 检索结果列表（按分数降序）
+        """
+        if not self.bm25:
+            logger.error("BM25 索引未加载")
+            return []
+        
+        # 查询分词
+        tokenized_query = list(jieba.cut(query))
+        
+        # BM25 打分
+        scores = self.bm25.get_scores(tokenized_query)
+        
+        # 取 Top-K
+        # 使用 argsort 获取排序索引
+        import numpy as np
+        top_indices = np.argsort(scores)[-self.top_k:][::-1]
+        
+        # 过滤低分结果（可选）
+        results = []
+        for idx in top_indices:
+            if scores[idx] < 0.1:  # 阈值过滤
+                continue
+            
+            doc = self.documents[idx]
+            results.append(BM25Result(
+                id=doc["id"],
+                content=doc["content"],
+                doc_name=doc["doc_name"],
+                doc_page=doc["doc_page"],
+                chunk_index=doc["chunk_index"],
+                score=scores[idx]
+            ))
+        
+        logger.info(f"BM25 检索完成：找到 {len(results)} 个片段（查询：{query}）")
+        return results
+    
+    def retrieve_with_highlights(
+        self, 
+        query: str,
+        highlight: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        BM25 检索（带关键词高亮）
+        
+        Args:
+            query: 用户查询
+            highlight: 是否高亮匹配词
+        
+        Returns:
+            包含高亮信息的检索结果
+        """
+        results = self.retrieve(query)
+        
+        # 提取查询词（用于高亮）
+        query_tokens = set(jieba.cut(query))
+        
+        highlighted_results = []
+        for r in results:
+            content = r.content
+            
+            # 高亮匹配词（简单实现）
+            if highlight:
+                for token in query_tokens:
+                    if len(token) > 1 and token in content:
+                        content = content.replace(token, f"**{token}**")
+            
+            highlighted_results.append({
+                "id": r.id,
+                "content": content,
+                "doc_name": r.doc_name,
+                "doc_page": r.doc_page,
+                "score": r.score,
+                "highlights": list(query_tokens & set(r.content.split()))
+            })
+        
+        return highlighted_results
+    
+    def refresh_index(self):
+        """
+        刷新 BM25 索引（当数据库文档更新时调用）
+        """
+        logger.info("刷新 BM25 索引...")
+        self.documents = []
+        self.tokenized_docs = []
+        self.bm25 = None
+        self._load_documents()
+
+
+# =============================================================================
+# 测试代码
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    
+    print("=" * 60)
+    print("BM25 检索器测试")
+    print("=" * 60)
+    
+    # 创建检索器
+    retriever = BM25Retriever(top_k=5)
+    
+    # 测试查询
+    test_queries = [
+        "李世民",
+        "玄武门之变",
+        "贞观之治",
+        "王洪文",
+    ]
+    
+    for query in test_queries:
+        print(f"\n{'='*60}")
+        print(f"查询：{query}")
+        print(f"{'='*60}")
+        
+        results = retriever.retrieve(query)
+        
+        if not results:
+            print("  未找到匹配结果")
+            continue
+        
+        for i, r in enumerate(results, 1):
+            print(f"\n  [{i}] 分数：{r.score:.3f}")
+            print(f"      来源：{r.doc_name} 第{r.doc_page}页")
+            print(f"      内容：{r.content[:100]}...")
+    
+    print(f"\n{'='*60}")
+    print("测试完成")
+    print(f"{'='*60}")

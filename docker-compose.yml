@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  historical-faq-bot:
+    build: .
+    container_name: historical-faq-bot
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LANG=C.UTF-8
+      - USE_LANGCHAIN=false
+      - EMBEDDING_MODEL_PATH=/app/models/bge-m3-finetuned-wang
+      - RERANKER_MODEL_PATH=/app/models/maidalun/bce-reranker-base_v1
+      - LOCAL_LLM_PATH=/app/models/qwen/Qwen1.5-7B-Chat
+      - LLM_MODE=local
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=faq_user
+      - PG_PASSWORD=faq_password
+      - PG_DATABASE=faq_db
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=faq_user
+      - POSTGRES_PASSWORD=faq_password
+      - POSTGRES_DB=faq_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

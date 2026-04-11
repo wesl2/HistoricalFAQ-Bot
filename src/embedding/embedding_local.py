@@ -1,0 +1,100 @@
+# -*- coding: utf-8 -*-
+"""
+本地 Embedding 模型封装
+
+基于 BGE-M3 的文本向量化实现
+"""
+
+import logging
+import torch
+import torch.nn.functional as F
+from typing import Union, List
+from transformers import AutoTokenizer, AutoModel
+from config.model_config import EMBEDDING_CONFIG
+
+logger = logging.getLogger(__name__)
+
+# 全局模型实例（单例模式，避免重复加载）
+_tokenizer = None
+_model = None
+_device = None
+
+
+def _load_model():
+    """延迟加载模型"""
+    global _tokenizer, _model, _device
+    
+    if _model is None:
+        logger.info(f"正在加载 Embedding 模型: {EMBEDDING_CONFIG['model_path']}")
+        
+        _device = torch.device(EMBEDDING_CONFIG['device'])
+        
+        _tokenizer = AutoTokenizer.from_pretrained(
+            EMBEDDING_CONFIG['model_path']
+        )
+        
+        _model = AutoModel.from_pretrained(
+            EMBEDDING_CONFIG['model_path']
+        ).to(_device)
+        
+        _model.eval()
+        
+        if EMBEDDING_CONFIG['use_fp16'] and _device.type == 'cuda':
+            _model = _model.half()
+            
+        logger.info("Embedding 模型加载完成")
+
+
+def compute_embedding(text: Union[str, List[str]]) -> Union[List[float], None]:
+    """
+    计算文本的嵌入向量
+    
+    Args:
+        text: 输入文本或文本列表
+        
+    Returns:
+        归一化后的向量（1024维），出错返回 None
+    """
+    _load_model()
+    
+    try:
+        # 编码输入
+        encoded_input = _tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=EMBEDDING_CONFIG['max_length'],
+            return_tensors='pt'
+        ).to(_device)
+        
+        # 计算向量
+        with torch.no_grad():
+            model_output = _model(**encoded_input)
+            # 取 [CLS] token 作为句子表示
+            sentence_embedding = model_output[0][:,0,:]
+            # L2 归一化
+            sentence_embedding = F.normalize(sentence_embedding, p=2, dim=1)
+            
+        # 转换为 Python list
+        if isinstance(text, str):
+            return sentence_embedding.cpu().numpy()[0].tolist()
+        else:
+            return sentence_embedding.cpu().numpy().tolist()
+            
+    except Exception as e:
+        logger.error(f"计算 embedding 失败: {e}")
+        return None
+
+
+def get_embedding(text: Union[str, List[str]]) -> List[float]:
+    """
+    获取文本向量（兼容旧接口）
+    
+    如果输入是单条文本，自动包装为列表
+    """
+    result = compute_embedding(text)
+    if result is None:
+        # 返回零向量作为 fallback
+        dim = EMBEDDING_CONFIG['vector_dim']
+        return [0.0] * dim if isinstance(text, str) else [[0.0] * dim]
+    return result
