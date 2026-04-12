@@ -29,7 +29,7 @@ project_root = Path(__file__).parent.parent.parent  # 根据文件层级调整
 sys.path.insert(0,str(project_root))
 # ======================================
 import psycopg2
-
+from typing import Iterator
 from psycopg2 import pool
 from contextlib import contextmanager
 from config.pg_config import PG_URL, POOL_MIN_CONN, POOL_MAX_CONN
@@ -189,9 +189,9 @@ def get_connection(cursor_factory=None):
 # - 调用者只需要处理 cursor，connection 自动管理
 
 @contextmanager
-def get_cursor():
+def get_cursor(cursor_factory: type[psycopg2.extensions.cursor] | None = None)-> Iterator[psycopg2.extensions.cursor]:
     with get_connection() as conn:
-        with conn.cursor() as cursor:
+        with conn.cursor(cursor_factory=cursor_factory) as cursor:
             yield cursor
 # =============================================================================
 # TODO 8: 实现 check_connection() 健康检查

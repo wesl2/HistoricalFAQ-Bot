@@ -6,5 +6,6 @@ Embedding 模块
 """
 
 from .embedding_local import get_embedding, compute_embedding
+from .embedding_local_practice import get_embedding, compute_embedding
 
 __all__ = ['get_embedding', 'compute_embedding']

@@ -18,7 +18,7 @@ PG_HISTORICAL_TABLE = "HistoricalRAG"
 # 可从环境变量 PG_URL 读取，默认使用本地开发配置
 PG_URL = os.getenv(
     "PG_URL", 
-    "postgresql://用户名:密码@localhost:5432/faq_db?sslmode=prefer&client_encoding=utf8"
+    "postgresql://wesl:151083@localhost:5432/faq_db?sslmode=prefer&client_encoding=utf8"
 )
 
 # 数据库表名配置
