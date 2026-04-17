@@ -26,6 +26,7 @@ from typing import List, Dict, Any
 from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
 import jieba  # 中文分词
+import numpy as np
 
 from src.vectorstore.pg_pool import get_connection
 from config.pg_config import PG_DOC_TABLE
@@ -133,7 +134,8 @@ class BM25Retriever:
         
         # 取 Top-K
         # 使用 argsort 获取排序索引
-        import numpy as np
+        # 通过 BM25 获取的是分数  ， np.argsort(scores) 返回的才是索引
+
         top_indices = np.argsort(scores)[-self.top_k:][::-1]
         
         # 过滤低分结果（可选）

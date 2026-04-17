@@ -83,7 +83,7 @@ class FAQResult(BaseModel):
                 return "general"  # 默认分类
             elif info.field_name == "source_doc":
                 return "unknown"  # 默认来源文档
-        return v
+        return v.strip()
     @field_validator("similarity", mode="before")
     @classmethod
     def default_similarity(cls, v):

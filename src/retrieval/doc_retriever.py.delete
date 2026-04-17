@@ -98,7 +98,7 @@ class DocRetriever:
         # BM25 检索器（懒加载）
         self._bm25_retriever = None
 
-        if self.use_bm22:
+        if self.use_bm25:
             logger.info(
                 f"BM25 混合检索已启用："
                 f"融合方法={fusion_method}, "
@@ -110,7 +110,7 @@ class DocRetriever:
     def bm25_retriever(self):
         """懒加载 BM25 检索器"""
         if self._bm25_retriever is None:
-            from .bm25_retriever import BM25Retriever
+            from .bm25_retriever_practice import BM25Retriever
             self._bm25_retriever = BM25Retriever(top_k=self.top_k * 2)
         return self._bm25_retriever
 
