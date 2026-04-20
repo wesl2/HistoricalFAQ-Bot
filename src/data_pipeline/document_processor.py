@@ -13,8 +13,12 @@ from typing import List, Dict, Any
 from pathlib import Path
 
 from langchain_community.document_loaders import (
-    PyPDFLoader, TextLoader, DocxLoader, UnstructuredFileLoader
+    PyPDFLoader, TextLoader, UnstructuredFileLoader
 )
+try:
+    from langchain_community.document_loaders import Docx2txtLoader as DocxLoader
+except ImportError:
+    from langchain_community.document_loaders import UnstructuredWordDocumentLoader as DocxLoader
 from langchain_text_splitters import (
     RecursiveCharacterTextSplitter, CharacterTextSplitter
 )

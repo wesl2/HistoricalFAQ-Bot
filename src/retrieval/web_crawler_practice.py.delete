@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+网页爬虫练习版 - 用于爬取中国重大历史事件数据
+
+目标网站：https://zhonghua.5000yan.com/
+练习目标：将一个简单的 requests + lxml 爬虫改造成生产级健壮爬虫
+
+【练习说明】
+本文件只包含注释、TODO 提示和空函数框架。
+你需要根据 TODO 中的提示，一步步补全代码。
+每个 TODO 都标注了难度（⭐ 简单 / ⭐⭐ 中等 / ⭐⭐⭐ 困难）。
+
+【参考原脚本】
+原脚本路径（供对照）：/root/autodl-tmp/RAG_Test/FalgEmbedding_test/ 下的相关爬虫脚本
+
+【生产级爬虫应该具备的能力】
+1. 错误处理与重试机制（网络抖动、目标网站 5xx）
+2. 请求限速（Rate Limiting），避免被封 IP
+3. 增量同步（只爬取新增/变更的内容）
+4. 数据持久化（边爬边存，崩溃后可恢复）
+5. 用户代理池与代理 IP（应对反爬）
+6. 编码智能检测（避免中文乱码）
+7. 多线程/异步并发（提升爬取效率）
+8. 数据清洗与结构化（直接输出可用文本）
+"""
+
+# =============================================================================
+# 第一部分：导入模块
+# =============================================================================
+# TODO 1.1 ⭐ 导入必要的标准库和第三方库
+# 提示：
+#   - requests: 发送 HTTP 请求
+#   - lxml.etree: 解析 HTML（xpath 提取数据）
+#   - typing: 类型提示（Optional, List, Tuple 等）
+#   - os / pathlib: 路径操作和目录创建
+#   - time / random: 限速用的 sleep 和随机间隔
+#   - hashlib: 计算内容哈希（用于增量去重）
+#   - logging: 记录爬取日志（替代 print）
+#   - json: 保存爬取状态/索引
+#
+# TODO 1.2 ⭐ 导入 requests 的重试适配器（生产级必备）
+# 提示：
+#   from requests.adapters import HTTPAdapter
+#   from urllib3.util.retry import Retry
+#
+# TODO 1.3 ⭐ 可选导入（用于更高级的练习）
+# 提示：
+#   - fake_useragent: 随机生成 User-Agent
+#   - chardet: 智能检测网页编码
+
+
+# =============================================================================
+# 第二部分：常量配置
+# =============================================================================
+# TODO 2.1 ⭐ 定义目标网站基础配置
+# 提示：
+#   BASE_URL = 'https://zhonghua.5000yan.com/'
+#   HEADERS = {'User-Agent': '...'}
+#   OUTPUT_DIR = './history_data'  # 爬取结果保存目录
+#   INDEX_FILE = './crawl_index.json'  # 爬取索引（记录已爬取的 URL 和哈希）
+
+# TODO 2.2 ⭐⭐ 定义爬虫行为配置（生产级参数）
+# 提示：
+#   REQUEST_TIMEOUT = 10  # 单次请求超时秒数
+#   RETRY_TIMES = 3       # 失败重试次数
+#   RETRY_BACKOFF = 1     # 重试间隔退避因子（指数退避）
+#   MIN_DELAY = 0.5       # 请求间隔最小秒数
+#   MAX_DELAY = 2.0       # 请求间隔最大秒数
+#   BATCH_SIZE = 10       # 每爬 10 条保存一次索引
+
+
+# =============================================================================
+# 第三部分：日志配置
+# =============================================================================
+# TODO 3.1 ⭐ 配置 logging
+# 提示：
+#   logging.basicConfig(
+#       level=logging.INFO,
+#       format='%(asctime)s - %(levelname)s - %(message)s'
+#   )
+#   logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# 第四部分：HTTP 会话管理（生产级核心）
+# =============================================================================
+class CrawlSession:
+    """
+    带重试、限速、持久化的 HTTP 会话管理器
+    
+    为什么不用裸 requests.get()？
+    因为生产环境需要：
+    1. 自动重试（网络抖动、目标服务器 502/503）
+    2. 连接复用（Session 保持 TCP 连接，减少握手开销）
+    3. 统一配置（超时、Headers 集中管理）
+    """
+    
+    def __init__(self):
+        # TODO 4.1 ⭐⭐ 创建 requests.Session 并配置重试策略
+        # 提示：
+        #   self.session = requests.Session()
+        #   retries = Retry(total=..., backoff_factor=..., status_forcelist=[502,503,504])
+        #   self.session.mount('https://', HTTPAdapter(max_retries=retries))
+        pass
+    
+    def get(self, url: str) -> Optional[requests.Response]:
+        """
+        发送 GET 请求，带错误处理和限速
+        
+        TODO 4.2 ⭐⭐ 实现安全请求
+        提示：
+        1. 使用 self.session.get(url, headers=..., timeout=...) 发送请求
+        2. 调用 response.raise_for_status() 检查 4xx/5xx
+        3. 如果异常，记录 error 日志并返回 None
+        4. 请求成功后，time.sleep(random.uniform(MIN_DELAY, MAX_DELAY)) 限速
+        
+        Returns:
+            Response 对象（成功）或 None（失败）
+        """
+        pass
+    
+    def close(self):
+        """关闭会话，释放连接池"""
+        # TODO 4.3 ⭐ 调用 self.session.close()
+        pass
+
+
+# =============================================================================
+# 第五部分：数据存储
+# =============================================================================
+class DataStore:
+    """
+    数据持久化管理器
+    
+    职责：
+    1. 边爬边存（防止程序崩溃后数据丢失）
+    2. 增量索引（记录已爬取的 URL 和内容哈希）
+    3. 输出文件管理（按标题命名、去重存储）
+    """
+    
+    def __init__(self, output_dir: str = "./history_data", index_file: str = "./crawl_index.json"):
+        # TODO 5.1 ⭐ 初始化目录和索引
+        # 提示：
+        #   - 用 os.makedirs 创建 output_dir（exist_ok=True）
+        #   - 加载已有的 index_file（如果不存在则初始化空 dict）
+        #   - self.index 结构：{url: {"title": str, "hash": str, "file": str}}
+        pass
+    
+    def load_index(self) -> dict:
+        """加载爬取索引"""
+        # TODO 5.2 ⭐ 读取 index_file，不存在返回 {}
+        pass
+    
+    def save_index(self):
+        """保存爬取索引到磁盘"""
+        # TODO 5.3 ⭐ 将 self.index 写入 index_file
+        pass
+    
+    def exists(self, url: str, content: str) -> bool:
+        """
+        检查内容是否已存在且未变更
+        
+        TODO 5.4 ⭐⭐ 实现增量去重逻辑
+        提示：
+        1. 如果 url 不在 index 中 → 返回 False（需要爬取）
+        2. 计算 content 的 MD5 hash
+        3. 如果 hash 和 index[url]["hash"] 一致 → 返回 True（已存在且未变）
+        4. 否则 → 返回 False（内容已变更，需要更新）
+        """
+        pass
+    
+    def save(self, title: str, url: str, content: str) -> str:
+        """
+        保存爬取内容到文件，并更新索引
+        
+        TODO 5.5 ⭐⭐ 实现保存逻辑
+        提示：
+        1. 清理 title 中的非法文件名字符（如 / \ : * ? " < > |）
+        2. 构造文件路径：output_dir / title.txt
+        3. 写入文件（utf-8 编码）
+        4. 计算 content 的 MD5，更新 index[url] = {"title": title, "hash": md5, "file": filepath}
+        5. 返回保存的文件路径
+        """
+        pass
+    
+    def get_stats(self) -> dict:
+        """返回爬取统计信息"""
+        # TODO 5.6 ⭐ 返回 {"total": 总数, "new": 新增数, "updated": 更新数, "skipped": 跳过数}
+        pass
+
+
+# =============================================================================
+# 第六部分：网页解析
+# =============================================================================
+class PageParser:
+    """
+    HTML 解析器
+    
+    职责：
+    1. 从首页提取所有文章链接（目录页解析）
+    2. 从文章页提取正文内容（详情页解析）
+    3. 编码智能处理（防止中文乱码）
+    """
+    
+    @staticmethod
+    def parse_index(html_text: str) -> Tuple[List[str], List[str]]:
+        """
+        解析首页，提取所有文章标题和链接
+        
+        TODO 6.1 ⭐ 实现目录页解析
+        提示：
+        1. tree = etree.HTML(html_text)
+        2. titles = tree.xpath("//li[@class='list-inline-item px-2 text-body-secondary m-2']/a/text()")
+        3. urls = tree.xpath("//li[@class='list-inline-item px-2 text-body-secondary m-2']/a/@href")
+        4. 注意：urls 可能是相对路径（如 /xuannwumen.html），需要拼接成绝对 URL
+        
+        Returns:
+            (titles, urls) 两个列表
+        """
+        pass
+    
+    @staticmethod
+    def parse_article(html_text: str) -> Optional[str]:
+        """
+        解析文章页，提取正文内容
+        
+        TODO 6.2 ⭐ 实现详情页解析
+        提示：
+        1. tree = etree.HTML(html_text)
+        2. texts = tree.xpath('//div[@class="grap"]//text()')
+        3. content = "".join(texts)
+        4. 清洗内容：去除 \n, \t, 多余空格
+        5. 如果内容为空（可能被反爬或页面结构变了），返回 None
+        
+        Returns:
+            清洗后的正文字符串，或 None（解析失败）
+        """
+        pass
+    
+    @staticmethod
+    def smart_decode(response) -> str:
+        """
+        智能解码响应内容
+        
+        TODO 6.3 ⭐⭐ 实现编码智能检测
+        提示：
+        1. 优先尝试 response.apparent_encoding（requests 的编码猜测）
+        2. 如果失败，尝试 response.encoding
+        3. 如果都失败，尝试 'utf-8' 和 'gbk' 兜底
+        4. 用 response.content.decode(encoding) 解码
+        
+        为什么不用 response.text？
+        因为 response.text 用的 encoding 可能不准，对于中文网站容易乱码。
+        """
+        pass
+
+
+# =============================================================================
+# 第七部分：爬虫主控
+# =============================================================================
+class HistoryCrawler:
+    """
+    历史事件爬虫主控器
+    
+    职责：
+    1. 调度爬取流程（先抓目录，再抓详情）
+    2. 管理爬取状态（进度、统计、异常处理）
+    3. 支持增量更新（只爬新增/变更的内容）
+    """
+    
+    def __init__(self, base_url: str = None, output_dir: str = None):
+        # TODO 7.1 ⭐ 初始化组件
+        # 提示：
+        #   self.session = CrawlSession()
+        #   self.store = DataStore(output_dir=output_dir)
+        #   self.parser = PageParser()
+        #   self.base_url = base_url or BASE_URL
+        pass
+    
+    def crawl_index(self) -> Tuple[List[str], List[str]]:
+        """
+        爬取首页目录
+        
+        TODO 7.2 ⭐⭐ 实现目录页爬取
+        提示：
+        1. 调用 self.session.get(self.base_url) 获取首页
+        2. 如果返回 None（请求失败），记录错误并返回空列表
+        3. 用 self.parser.smart_decode(response) 解码 HTML
+        4. 用 self.parser.parse_index(html_text) 提取标题和链接
+        5. 记录 info 日志："发现 N 篇文章"
+        """
+        pass
+    
+    def crawl_article(self, title: str, url: str) -> bool:
+        """
+        爬取单篇文章
+        
+        TODO 7.3 ⭐⭐⭐ 实现单篇文章爬取（最核心逻辑）
+        提示：
+        1. 请求文章页：response = self.session.get(url)
+        2. 如果失败，返回 False
+        3. 解码 HTML：html_text = self.parser.smart_decode(response)
+        4. 解析正文：content = self.parser.parse_article(html_text)
+        5. 如果 content 为空，返回 False
+        6. 检查增量：if self.store.exists(url, content) → logger.info("跳过未变更内容") → 返回 True
+        7. 保存内容：file_path = self.store.save(title, url, content)
+        8. 记录成功日志：logger.info(f"已保存: {title} -> {file_path}")
+        9. 每 BATCH_SIZE 条调用一次 self.store.save_index()（防崩溃丢失进度）
+        
+        Returns:
+            True（成功/跳过）或 False（失败）
+        """
+        pass
+    
+    def run(self, incremental: bool = True):
+        """
+        执行完整爬取流程
+        
+        TODO 7.4 ⭐⭐⭐ 实现主流程
+        提示：
+        1. 调用 self.crawl_index() 获取所有文章标题和链接
+        2. 如果没有获取到，记录 error 并退出
+        3. 遍历所有文章，逐个调用 self.crawl_article(title, url)
+        4. 统计结果：成功数、失败数、跳过数
+        5. 最后调用 self.store.save_index() 保存最终索引
+        6. 打印统计报告
+        7. 关闭 session：self.session.close()
+        
+        Args:
+            incremental: True 表示增量模式（跳过未变更内容），False 表示全量模式
+        """
+        pass
+
+
+# =============================================================================
+# 第八部分：命令行入口
+# =============================================================================
+def main():
+    """
+    命令行入口
+    
+    TODO 8.1 ⭐ 实现命令行参数解析和爬虫启动
+    提示：
+    1. 用 argparse 解析参数：
+       - --output: 输出目录（默认 ./history_data）
+       - --full: 全量模式（忽略增量索引，重新爬取全部）
+       - --max: 最多爬取多少条（用于测试）
+    2. 创建 HistoryCrawler 实例
+    3. 调用 crawler.run(incremental=not args.full)
+    """
+    pass
+
+
+if __name__ == '__main__':
+    main()

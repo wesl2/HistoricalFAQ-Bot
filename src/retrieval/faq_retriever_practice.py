@@ -63,12 +63,11 @@ class FAQResult(BaseModel):
     model_config = ConfigDict(frozen=True)  #  冻结：创建后不可修改字段值
     id: int
     question: str
-    similar_question: str
     answer: str
     similarity: float = Field(ge=0.0, le=1.0)  # 0-1范围
     category: str
     source_doc: str
-    @field_validator("similar_question","answer","question",mode="before") #修饰下面的方法，表示在校验前处理输入值
+    @field_validator("answer","question",mode="before") #修饰下面的方法，表示在校验前处理输入值
     @classmethod
     def strip_whitespace(cls, v):
         if v is None:
@@ -143,29 +142,23 @@ class FAQRetriever:
         with get_cursor() as cursor:
                 
             cursor.execute(f"""
-            SELECT id,question,similar_question,answer,                       
-            1 - (similar_question_vector <=> %s::vector) AS similarity,
-            category,source_doc
+            SELECT id, question, answer,                       
+            1 - (question_vector <=> %s::vector) AS similarity,
+            category, source_doc
             FROM {PG_TABLE_NAME}
             ORDER BY similarity DESC
             LIMIT %s;
-    """, (query_str, self.top_k))            
-    # 步骤3：处理结果
-    # 使用 cursor.fetchall() 获取所有行
-    # 遍历每一行，创建 FAQResult 对象
-    # 注意：row[4] 是 similarity，可能为 None，需要处理
-    # category 和 source_doc 如果为 None，给默认值 "general"/"unknown"
-    # 你的代码：
+            """, (query_str, self.top_k))            
+            # 步骤3：处理结果
             results = []
             for row in cursor.fetchall():
                 results.append(FAQResult(
                     id=row[0],
                     question=row[1],
-                    similar_question=row[2],
-                    answer=row[3],
-                    similarity=row[4],
-                    category=row[5],
-                    source_doc=row[6]
+                    answer=row[2],
+                    similarity=row[3],
+                    category=row[4],
+                    source_doc=row[5]
                 ))
         
         logger.info(f"FAQ 检索完成：找到 {len(results)} 条记录")
@@ -177,25 +170,25 @@ def fill_vectors(batch_size: int = 50):
     updated = 0
     with get_cursor(cursor_factory=RealDictCursor) as cursor:
         cursor.execute(f"""
-            SELECT id, similar_question FROM {PG_TABLE_NAME}
-            WHERE similar_question_vector IS NULL
-            order by id ASC
+            SELECT id, question FROM {PG_TABLE_NAME}
+            WHERE question_vector IS NULL
+            ORDER BY id ASC
             """
         )
         rows = cursor.fetchall()
         logger.info(f"待回填行数: {len(rows)}")
         for row in rows:
-            text = (row["similar_question"] or "").strip() #similar_question
+            text = (row["question"] or "").strip()
             vec = get_embedding(text)
             vec_str = "[" + ",".join(map(str, vec)) + "]"
             cursor.execute(f"""
                 UPDATE {PG_TABLE_NAME}
-                SET similar_question_vector = %s::vector
+                SET question_vector = %s::vector
                 WHERE id = %s   
             """, (vec_str, row["id"]))
             updated += 1
             if updated % batch_size == 0:
-             logger.info(f"回填完成，共 {updated} 条记录")
+                logger.info(f"回填完成，共 {updated} 条记录")
 # =============================================================================
 # TODO 5: 测试代码
 # =============================================================================

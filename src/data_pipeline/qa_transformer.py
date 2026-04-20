@@ -6,7 +6,7 @@ QA 格式转换器
 将 RAG_Test 格式的 QA 数据转换为 FAQ 格式
 
 RAG 格式: {"query": "...", "pos": ["..."], "neg": [...]}
-FAQ 格式: {"question": "...", "similar_question": "...", "answer": "...", "metadata": {...}}
+FAQ 格式: {"question": "...", "answer": "...", "metadata": {...}}
 """
 
 import json
@@ -52,7 +52,6 @@ def transform_rag_to_faq(
                 # 转换格式
                 faq_record = {
                     "question": rag_record["query"],
-                    "similar_question": rag_record["query"],  # 初始用 query，后续可扩展
                     "answer": rag_record["pos"][0] if rag_record.get("pos") else "",
                     "metadata": {
                         "source_doc": source_doc,

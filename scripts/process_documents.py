@@ -12,11 +12,14 @@
     # 处理整个目录
     python scripts/process_documents.py data/raw/ --output-dir vectorstore/
     
-    # 使用高级检索器（Multi-Query + Rerank）
-    python scripts/process_documents.py data/raw/ --advanced
-    
     # 指定向量库类型
     python scripts/process_documents.py data/raw/ --vectorstore-type faiss
+
+【修改留痕 - 2024-04-17】
+- 原高级检索器（advanced_retriever）模块在重构中已移除，
+  因此删除对 src.rag.advanced_retriever 的引用。
+- use_advanced 分支改为抛出 NotImplementedError，防止用户误用 --advanced 参数。
+- 其余基础向量库创建逻辑保持不变。
 """
 
 import os
@@ -27,7 +30,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data_pipeline.document_processor import DocumentProcessor
-from src.rag.advanced_retriever import get_advanced_retriever
+# 2024-04-17 修复：advanced_retriever 模块已在重构中移除，暂时无法使用高级检索器
+# from src.rag.advanced_retriever import get_advanced_retriever
 from langchain_community.vectorstores import Chroma, FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from config.model_config import EMBEDDING_CONFIG, LANGCHAIN_CONFIG
@@ -70,12 +74,12 @@ def process_single_file(
     
     # 2. 创建向量库
     if use_advanced:
-        # 使用高级检索器（带持久化）
-        retriever = get_advanced_retriever()
-        retriever.create_vectorstore(chunks, vectorstore_type=vectorstore_type)
-        print(f"✅ 向量库创建完成（使用高级检索器）")
-        return retriever
-    else:
+        # 2024-04-17 修复：advanced_retriever 已不可用
+        raise NotImplementedError(
+            "高级检索器（--advanced）在重构中已移除，"
+            "请直接使用基础向量库创建（去掉 --advanced 参数）。"
+        )
+    # 基础向量库创建
         # 基础向量库创建
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_CONFIG["model_path"],
@@ -172,11 +176,12 @@ def process_directory(
     
     # 创建统一向量库
     if use_advanced:
-        retriever = get_advanced_retriever()
-        retriever.create_vectorstore(all_chunks, vectorstore_type=vectorstore_type)
-        print(f"✅ 统一向量库创建完成（使用高级检索器）")
-        return retriever
-    else:
+        # 2024-04-17 修复：advanced_retriever 已不可用（process_directory 中的漏改）
+        raise NotImplementedError(
+            "高级检索器（--advanced）在重构中已移除，"
+            "请直接使用基础向量库创建（去掉 --advanced 参数）。"
+        )
+    # 基础向量库创建
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_CONFIG["model_path"],
             model_kwargs={"device": EMBEDDING_CONFIG["device"]},

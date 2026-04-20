@@ -20,6 +20,8 @@ from langchain_core.documents import Document
 from langchain_community.chat_message_histories import PostgresChatMessageHistory
 
 from src.retrieval.search_router import SearchRouter
+from src.retrieval.faq_retriever_practice import FAQRetriever
+from src.retrieval.doc_retriever_practice import DocRetriever
 from config.pg_config import PG_URL, PG_CHAT_TABLE
 from src.llm.llm_factory import LLMFactory
 from src.chat.response_generator import ResponseGenerator
@@ -58,7 +60,19 @@ class ChatEngine:
             chain_type: 链类型 (rag, conversational, conversational_retrieval)
             session_id: 会话ID，用于持久化对话历史，None则自动生成
         """
-        self.search_router = SearchRouter()
+        # 依赖注入：在外部创建检索器实例，传入 SearchRouter
+        # 这样 ChatEngine 控制用什么检索器，SearchRouter 只负责路由逻辑
+        faq_retriever = FAQRetriever(top_k=3)
+        doc_retriever = DocRetriever(
+            top_k=10,
+            use_bm25=True,
+            fusion_method="rrf",
+            rrf_k=60
+        )
+        self.search_router = SearchRouter(
+            faq_retriever=faq_retriever,
+            doc_retriever=doc_retriever
+        )
         self.llm = LLMFactory.create_llm(llm_mode)
         self.response_gen = ResponseGenerator(self.llm)
         

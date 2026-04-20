@@ -60,13 +60,11 @@ class FAQIndexer:
         # 处理 RAG 格式转换
         if "query" in record and "pos" in record:
             question = record["query"]
-            similar_question = record.get("similar_question", question)
             answer = record["pos"][0] if record["pos"] else ""
             vector = record.get("vector", [0.0] * 1024)
             metadata = record.get("metadata", {})
         else:
             question = record["question"]
-            similar_question = record["similar_question"]
             answer = record["answer"]
             vector = record.get("vector", [0.0] * 1024)
             metadata = record.get("metadata", {})
@@ -79,7 +77,7 @@ class FAQIndexer:
         confidence = metadata.get("confidence", 0.9)
         created_by = metadata.get("created_by", "auto")
         
-        return (question, similar_question, vector_str, answer,
+        return (question, vector_str, answer,
                 category, source_doc, source_page, confidence, created_by)
     
     def _insert_batch(self, rows: List[tuple]) -> int:
@@ -89,10 +87,11 @@ class FAQIndexer:
         
         insert_sql = f"""
             INSERT INTO {self.table_name} 
-            (question, similar_question, similar_question_vector, answer,
+            (question, question_vector, answer,
              category, source_doc, source_page, confidence, created_by)
             VALUES %s
         """
+
         
         with get_connection() as conn:
             cursor = conn.cursor()

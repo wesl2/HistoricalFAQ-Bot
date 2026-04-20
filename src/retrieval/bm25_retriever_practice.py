@@ -139,8 +139,13 @@ class BM25Retriever:
         for doc in self.documents:
             tokens = list(jieba.cut(doc["content"])) #list[list[str]]
             self.tokenized_docs.append(tokens)
-        # index as bm25
-
+        
+        # 空文档保护：文档表为空时不初始化 BM25，避免 ZeroDivisionError
+        if not self.tokenized_docs:
+            logger.warning("文档表为空，BM25 索引未初始化")
+            self.bm25 = None
+            return
+        
         # corpus 必须是 List[List[str]]（列表的列表），即每个文档已经分词后的词列表。
         self.bm25 = BM25Okapi(self.tokenized_docs)
         logger.info(f"文档加载完成，数量: {len(self.documents)}, 总词数: {sum(len(tokens) for tokens in self.tokenized_docs)}")

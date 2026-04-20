@@ -37,11 +37,10 @@ def create_tables(drop_existing: bool = False):
                 CREATE TABLE IF NOT EXISTS {PG_TABLE_NAME} (
                     id SERIAL PRIMARY KEY,
                     question TEXT NOT NULL,
-                    similar_question TEXT NOT NULL,
-                    similar_question_vector vector({VECTOR_DIM}),
+                    question_vector vector({VECTOR_DIM}),
                     answer TEXT NOT NULL,
                     search_vector tsvector 
-                        GENERATED ALWAYS AS (to_tsvector('simple', similar_question)) STORED,
+                        GENERATED ALWAYS AS (to_tsvector('simple', question)) STORED,
                     category VARCHAR(50),
                     source_doc VARCHAR(200),
                     source_page INTEGER,
@@ -56,7 +55,7 @@ def create_tables(drop_existing: bool = False):
             cursor.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_hnsw_faq 
                 ON {PG_TABLE_NAME} 
-                USING hnsw (similar_question_vector vector_cosine_ops)
+                USING hnsw (question_vector vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64);
             """)
             

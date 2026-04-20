@@ -4,9 +4,14 @@
 测试新功能脚本
 
 测试内容：
-1. 高级检索器（Multi-Query + Rerank）
+1. 高级检索器（Multi-Query + Rerank）—— 已废弃
 2. 流式输出
 3. 监控指标
+
+【修改留痕 - 2024-04-17】
+- 高级检索器（advanced_retriever）模块在重构中已移除，
+  test_advanced_retriever() 改为直接提示不可用，不再尝试导入。
+- 其余 test_streaming、test_callbacks 逻辑保持不变。
 """
 
 import os
@@ -22,40 +27,10 @@ def test_advanced_retriever():
     print("测试 1: 高级检索器")
     print("=" * 60)
     
-    try:
-        from src.rag.advanced_retriever import get_advanced_retriever
-        from langchain_core.documents import Document
-        
-        # 创建检索器
-        retriever = get_advanced_retriever()
-        
-        # 创建测试文档
-        test_docs = [
-            Document(page_content="王洪文是四人帮成员之一，曾任中共中央副主席。", 
-                    metadata={"source": "test1"}),
-            Document(page_content="江青是四人帮的核心人物，是毛泽东的妻子。", 
-                    metadata={"source": "test2"}),
-            Document(page_content="张春桥是四人帮成员，曾任上海市委书记。", 
-                    metadata={"source": "test3"}),
-        ]
-        
-        # 创建向量库
-        retriever.create_vectorstore(test_docs, "chroma")
-        print("✓ 向量库创建成功（已持久化）")
-        
-        # 检索测试
-        results = retriever.retrieve("王洪文是谁？", k=2)
-        print(f"✓ 检索成功，返回 {len(results)} 个结果")
-        for i, doc in enumerate(results):
-            print(f"  [{i+1}] {doc.page_content[:50]}...")
-        
-        return True
-        
-    except Exception as e:
-        print(f"✗ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    # 2024-04-17 修复：advanced_retriever 模块已移除，该测试直接跳过
+    print("⚠ 高级检索器（advanced_retriever）在重构中已移除，本测试跳过")
+    print("  提示：如需测试检索功能，请使用 scripts/test_bm25.py 或新的标准检索器")
+    return False
 
 
 def test_streaming():

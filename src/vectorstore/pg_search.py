@@ -55,11 +55,11 @@ class FAQSearcher:
         sql = f"""
             SELECT 
                 id, question, answer,
-                1 - (similar_question_vector <=> %s::vector) as similarity,
+                1 - (question_vector <=> %s::vector) as similarity,
                 source_doc, source_page, category
             FROM {self.table_name}
-            WHERE 1 - (similar_question_vector <=> %s::vector) > %s
-            ORDER BY similar_question_vector <=> %s::vector
+            WHERE 1 - (question_vector <=> %s::vector) > %s
+            ORDER BY question_vector <=> %s::vector
             LIMIT %s;
         """
         

@@ -14,7 +14,7 @@ import sys
 import time
 sys.path.insert(0, '.')
 
-from src.retrieval.doc_retriever import DocRetriever
+from src.retrieval.doc_retriever_practice import DocRetriever
 from config.model_config import BM25_CONFIG
 
 
@@ -105,7 +105,7 @@ def test_retrieval_methods():
 
 def test_bm25_standalone():
     """测试独立的 BM25 检索器"""
-    from src.retrieval.bm25_retriever import BM25Retriever
+    from src.retrieval.bm25_retriever_practice import BM25Retriever
     
     print(f"\n{'='*60}")
     print("独立 BM25 检索器测试")

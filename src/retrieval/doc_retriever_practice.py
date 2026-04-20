@@ -86,7 +86,7 @@ class DocRetriever:
     def __init__(
         self,
         top_k: int = 10,
-        use_bm25: bool = False,
+        use_bm25: bool = True,
         bm25_weight: float = 0.3,
         fusion_method: str = "rrf",  # 【新增】融合方法：rrf 或 linear
         rrf_k: int = 60  # 【新增】RRF 参数 K
