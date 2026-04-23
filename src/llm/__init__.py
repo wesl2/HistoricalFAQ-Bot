@@ -2,9 +2,9 @@
 """
 LLM 模块
 
-标准 LangChain 接口（BaseChatModel）
+生产级 LLM 封装（StandardLLM）
 """
 
-from .standard_llm import get_standard_llm, StandardLLM
+from .standard_llm_new import StandardLLM, get_llm, get_llm_async
 
-__all__ = ['get_standard_llm', 'StandardLLM']
+__all__ = ['StandardLLM', 'get_llm', 'get_llm_async']

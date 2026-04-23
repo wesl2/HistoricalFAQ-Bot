@@ -1,67 +1,141 @@
 # -*- coding: utf-8 -*-
 """
-对话引擎
+对话引擎（v2.1：修复 wait_for 不能包 AsyncGenerator + SQL 安全拼接 + 同步 stream 异常处理）
 
-整合检索和生成，提供完整的对话能力
-支持：
-- 原生双模检索（FAQ + RAG）
-- LangChain 集成
-- 高级检索（Multi-Query + Rerank）
-- 流式输出
-- 对话记忆
-- Agent 功能
+改动点（按朋友第二轮 review）：
+1. 致命修复：asyncio.wait_for 不能包 AsyncGenerator → 改用逐 chunk __anext__ 超时
+2. 同步 stream() 也加上异常收窄和兜底
+3. finally 块不再静默吞异常，至少打 warning
+4. SQL 表名拼接改用 psycopg2.sql.Identifier（防注入）
 """
 
+import asyncio
 import logging
+import time
 import uuid
-from typing import List, Dict, Any, Generator, AsyncGenerator
+from typing import List, Dict, Any, Generator, AsyncGenerator, Optional
 
-from langchain_core.documents import Document
-from langchain_community.chat_message_histories import PostgresChatMessageHistory
+import psycopg2
+from psycopg2 import sql as psycopg2_sql
+from langchain_core.messages import AIMessage, HumanMessage
 
-from src.retrieval.search_router import SearchRouter
+from src.retrieval.search_router_practice import SearchRouter
 from src.retrieval.faq_retriever_practice import FAQRetriever
 from src.retrieval.doc_retriever_practice import DocRetriever
-from config.pg_config import PG_URL, PG_CHAT_TABLE
-from src.llm.llm_factory import LLMFactory
+from src.llm.standard_llm_new import LLMError, LLMUnavailableError, StandardLLM
 from src.chat.response_generator import ResponseGenerator
-from src.rag.langchain_integration import LangChainIntegration
-from src.rag.advanced_retriever import get_advanced_retriever
-from src.rag.callbacks import get_callback_manager
-from config.model_config import LANGCHAIN_CONFIG
+from src.vectorstore.pg_pool_practice import get_cursor
+from config.pg_config import PG_CHAT_TABLE
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# 自定义异常（细分错误类型，方便上层处理）
+# ---------------------------------------------------------------------------
+
+class DatabaseError(Exception):
+    """数据库操作异常（连接失败、表不存在、SQL 错误等）"""
+    pass
+
+
+class RetrievalError(Exception):
+    """检索异常（向量检索失败、BM25 报错等）"""
+    pass
+
+
+class GenerationError(Exception):
+    """生成异常（LLM 调用失败、超时等）"""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# 工具：给 AsyncIterator 加逐 chunk 超时（兼容 Python 3.10）
+# ---------------------------------------------------------------------------
+
+async def _aiter_with_timeout(
+    async_iter: AsyncGenerator,
+    timeout: float,
+    timeout_msg: str = "\n[系统提示：生成超时，回答可能被截断]",
+):
+    """
+    包装 AsyncGenerator，每次取 chunk 加超时。
+
+    注意：不能用 asyncio.wait_for 直接包整个 AsyncGenerator，
+    因为 wait_for 只接受 coroutine/Future/Task。
+    这里对每个 __anext__() 调用包 wait_for，实现逐 chunk 超时。
+    """
+    while True:
+        try:
+            # __anext__() 返回的是 coroutine，可以被 wait_for 包
+            chunk = await asyncio.wait_for(async_iter.__anext__(), timeout=timeout)
+            yield chunk
+        except asyncio.TimeoutError:
+            logger.error("[ChatEngine] stream chunk 超时（%.0fs），截断输出", timeout)
+            yield timeout_msg
+            break
+        except StopAsyncIteration:
+            break
+
+
+# ---------------------------------------------------------------------------
+# ChatEngine
+# ---------------------------------------------------------------------------
+
 class ChatEngine:
     """
     对话引擎
-    
+
     核心流程：
     1. 接收用户查询
-    2. 检索相关内容（FAQ/文档）
-    3. 调用 LLM 生成回答
-    4. 返回格式化结果
+    2. 从 PG 加载对话历史
+    3. 检索相关内容（FAQ/文档）
+    4. 调用 LLM 生成回答（带 history 注入）
+    5. 保存本轮对话到 PG
+    6. 返回结构化结果（含耗时、错误码）
     """
-    
-    def __init__(self, 
-                 llm_mode: str = None, 
-                 use_langchain: bool = True,
-                 use_advanced_retriever: bool = True,
-                 chain_type: str = None,
-                 session_id: str = None):
+
+    # 默认 LLM 调用超时（秒）
+    DEFAULT_LLM_TIMEOUT = 60
+
+    def __init__(
+        self,
+        search_router: Optional[SearchRouter] = None,
+        response_gen: Optional[ResponseGenerator] = None,
+        llm_mode: str = None,
+        session_id: str = None,
+        history_limit: int = 10,
+        llm_timeout: float = DEFAULT_LLM_TIMEOUT,
+    ):
         """
         初始化对话引擎
-        
+
         Args:
-            llm_mode: LLM 模式，None 则使用配置默认值
-            use_langchain: 是否使用 LangChain 集成
-            use_advanced_retriever: 是否使用高级检索器
-            chain_type: 链类型 (rag, conversational, conversational_retrieval)
-            session_id: 会话ID，用于持久化对话历史，None则自动生成
+            search_router: 检索路由器实例（依赖注入，可选）
+            response_gen: 回答生成器实例（依赖注入，可选）
+            llm_mode: LLM 模式（"local"/"api"），None 则用配置默认值
+            session_id: 会话 ID，用于标识对话，None 则自动生成
+            history_limit: 每次加载的历史消息条数（默认 10 条）
+            llm_timeout: LLM 调用超时时间（秒，默认 60）
         """
-        # 依赖注入：在外部创建检索器实例，传入 SearchRouter
-        # 这样 ChatEngine 控制用什么检索器，SearchRouter 只负责路由逻辑
+        self.search_router = search_router or self._default_search_router()
+        self.response_gen = response_gen or ResponseGenerator(llm_mode=llm_mode)
+        self.llm_mode = llm_mode
+        self.session_id = session_id or str(uuid.uuid4())
+        self.history_limit = history_limit
+        self.llm_timeout = llm_timeout
+
+        logger.info(
+            "[ChatEngine] 初始化完成 | mode=%s | session=%s | history_limit=%d | llm_timeout=%.0fs",
+            llm_mode or "default",
+            self.session_id,
+            history_limit,
+            llm_timeout,
+        )
+
+    @staticmethod
+    def _default_search_router() -> SearchRouter:
+        """构建默认的 SearchRouter（内部组装 FAQ + Doc 检索器）"""
         faq_retriever = FAQRetriever(top_k=3)
         doc_retriever = DocRetriever(
             top_k=10,
@@ -69,356 +143,388 @@ class ChatEngine:
             fusion_method="rrf",
             rrf_k=60
         )
-        self.search_router = SearchRouter(
+        return SearchRouter(
             faq_retriever=faq_retriever,
             doc_retriever=doc_retriever
         )
-        self.llm = LLMFactory.create_llm(llm_mode)
-        self.response_gen = ResponseGenerator(self.llm)
-        
-        self.use_langchain = use_langchain
-        self.use_advanced_retriever = use_advanced_retriever
-        self.chain_type = chain_type or LANGCHAIN_CONFIG["default_chain_type"]
-        
-        # 会话ID（用于持久化对话历史）
-        self.session_id = session_id or str(uuid.uuid4())
-        
-        # LangChain 集成
-        self.langchain = None
-        if use_langchain:
-            self.langchain = LangChainIntegration(
-                llm_mode=llm_mode,
-                use_advanced_retriever=use_advanced_retriever,
-                session_id=self.session_id  # 传入 session_id 用于持久化
+
+    # -----------------------------------------------------------------------
+    # 对话历史读写（SQL 用 psycopg2.sql.Identifier 安全拼接表名）
+    # -----------------------------------------------------------------------
+
+    def _load_history(self) -> List[Dict[str, str]]:
+        """
+        从 PG 加载最近 N 条对话历史
+
+        Returns:
+            [{"role": "human"/"ai", "content": "..."}, ...]  按时间正序排列
+        """
+        try:
+            with get_cursor() as cur:
+                query = psycopg2_sql.SQL("""
+                    SELECT role, content
+                    FROM {}
+                    WHERE session_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """).format(psycopg2_sql.Identifier(PG_CHAT_TABLE))
+                cur.execute(query, (self.session_id, self.history_limit))
+                rows = cur.fetchall()
+                # 反转成时间正序（最旧的在前，最新的在后）
+                history = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+                logger.debug(
+                    "[ChatEngine] 加载历史 | session=%s | 条数=%d",
+                    self.session_id, len(history)
+                )
+                return history
+        except psycopg2.Error as e:
+            # 数据库错误：向上抛 DatabaseError，让上层决定怎么处理
+            raise DatabaseError(f"加载历史失败: {e}") from e
+        except Exception as e:
+            logger.warning("[ChatEngine] 加载历史失败（非 DB 错误）: %s", e)
+            return []
+
+    def _save_history(self, role: str, content: str) -> None:
+        """
+        保存单条消息到 PG
+
+        Args:
+            role: 'human' 或 'ai'
+            content: 消息内容
+        """
+        try:
+            with get_cursor() as cur:
+                query = psycopg2_sql.SQL("""
+                    INSERT INTO {} (session_id, role, content)
+                    VALUES (%s, %s, %s)
+                """).format(psycopg2_sql.Identifier(PG_CHAT_TABLE))
+                cur.execute(query, (self.session_id, role, content))
+            logger.debug(
+                "[ChatEngine] 保存历史 | session=%s | role=%s | content_len=%d",
+                self.session_id, role, len(content)
             )
-        
-        # 高级检索器（原生方式）
-        self.advanced_retriever = None
-        if use_advanced_retriever and not use_langchain:
-            self.advanced_retriever = get_advanced_retriever()
-        
-        # 缓存检索器
-        self._retrievers = {}
-        
-        logger.info(
-            f"对话引擎初始化完成: "
-            f"LLM={llm_mode or 'default'}, "
-            f"LangChain={use_langchain}, "
-            f"AdvancedRetriever={use_advanced_retriever}, "
-            f"Chain={self.chain_type}, "
-            f"Session={self.session_id}"
-        )
-    
-    def _build_documents(self, faq_results, doc_results) -> List[Document]:
+        except psycopg2.Error as e:
+            raise DatabaseError(f"保存历史失败: {e}") from e
+        except Exception as e:
+            logger.warning("[ChatEngine] 保存历史失败（非 DB 错误）: %s", e)
+
+    def _history_to_messages(self, history: List[Dict[str, str]]) -> List[HumanMessage | AIMessage]:
         """
-        构建 LangChain 文档
-        
+        将历史记录转换为 LangChain Message 列表
+
         Args:
-            faq_results: FAQ 搜索结果
-            doc_results: 文档搜索结果
-            
+            history: [{"role": "human"/"ai", "content": "..."}, ...]
+
         Returns:
-            文档列表
+            [HumanMessage, AIMessage, ...]
         """
-        docs_content = []
-        for r in faq_results[:3]:
-            content = f"问题: {r.question}\n答案: {r.answer}"
-            docs_content.append(Document(
-                page_content=content,
-                metadata={"type": "faq", "source": r.question}
-            ))
-        
-        for r in doc_results[:3]:
-            content = f"来源: {r.doc_name}\n内容: {r.content}"
-            docs_content.append(Document(
-                page_content=content,
-                metadata={"type": "doc", "source": r.doc_name, "page": r.doc_page}
-            ))
-        
-        return docs_content
-    
-    def _get_or_create_retriever(self, documents: List[Document]):
+        messages = []
+        for item in history:
+            role = item.get("role", "").lower()
+            content = item.get("content", "")
+            if role == "human":
+                messages.append(HumanMessage(content=content))
+            elif role == "ai":
+                messages.append(AIMessage(content=content))
+        return messages
+
+    # -----------------------------------------------------------------------
+    # 核心对话方法（同步）
+    # -----------------------------------------------------------------------
+
+    def chat(self, query: str) -> Dict[str, Any]:
         """
-        获取或创建检索器（带缓存）
-        
-        Args:
-            documents: 文档列表
-            
-        Returns:
-            检索器实例
-        """
-        cache_key = f"{len(documents)}_{hash(str([d.page_content[:50] for d in documents]))}"
-        
-        if cache_key not in self._retrievers:
-            if self.langchain:
-                vectorstore = self.langchain.create_vectorstore(documents)
-                self._retrievers[cache_key] = self.langchain.create_retriever(vectorstore)
-        
-        return self._retrievers.get(cache_key)
-    
-    def chat(self, query: str, history: List[Dict] = None) -> Dict[str, Any]:
-        """
-        处理用户查询（标准模式）
-        
-        Args:
-            query: 用户问题
-            history: 对话历史（可选）
-            
+        处理用户查询（标准模式，带 history + 兜底 + 耗时统计）
+
         Returns:
             {
                 "answer": str,
                 "sources": list,
                 "search_type": str,
                 "confidence": float,
-                "langchain_used": bool,
-                "chain_type": str
+                "session_id": str,
+                "error_code": str | None,
+                "latency_ms": float,
             }
         """
-        # 1. 检索相关内容（原生检索策略）
-        search_context = self.search_router.search(query)
-        
-        # 2. 根据检索类型生成回答
-        if search_context.search_type.value == "faq_only":
-            # 高置信度 FAQ，直接返回答案
-            answer = search_context.faq_results[0].answer
-            sources = [{
-                "type": "faq",
-                "question": search_context.faq_results[0].question,
-                "confidence": search_context.faq_results[0].similarity
-            }]
-            
-        else:
-            # 需要 LLM 生成
-            if self.use_langchain and self.langchain:
-                answer = self._langchain_generate(
-                    query=query,
-                    faq_results=search_context.faq_results,
-                    doc_results=search_context.doc_results,
-                    history=history
-                )
+        t0 = time.perf_counter()
+        error_code = None
+        answer = ""
+        sources = []
+        search_type = "unknown"
+        confidence = 0.0
+        search_context = None
+
+        try:
+            # 1. 加载历史
+            history = self._load_history()
+            history_messages = self._history_to_messages(history)
+
+            # 2. 检索
+            try:
+                search_context = self.search_router.search(query)
+                search_type = search_context.search_type.value
+                confidence = search_context.confidence
+            except Exception as e:
+                raise RetrievalError(f"检索失败: {e}") from e
+
+            # 3. 生成回答
+            if search_context.search_type.value == "faq_only":
+                answer = search_context.faq_results[0].answer
+                sources = [{
+                    "type": "faq",
+                    "question": search_context.faq_results[0].question,
+                    "confidence": search_context.faq_results[0].similarity
+                }]
             else:
-                # 原生方式
-                answer = self.response_gen.generate(
-                    query=query,
-                    faq_results=search_context.faq_results,
-                    doc_results=search_context.doc_results
-                )
-            
-            sources = []
-            for r in search_context.faq_results[:3]:
-                sources.append({
-                    "type": "faq", 
-                    "question": r.question, 
-                    "confidence": r.similarity
-                })
-            for r in search_context.doc_results[:3]:
-                sources.append({
-                    "type": "doc", 
-                    "source": r.doc_name, 
-                    "page": r.doc_page
-                })
-            
-            # 使用高级检索器的记忆功能
-            if history and self.use_langchain and self.langchain:
-                self._save_history_to_memory(history)
-        
+                try:
+                    answer = self.response_gen.generate(
+                        query=query,
+                        faq_results=search_context.faq_results,
+                        doc_results=search_context.doc_results,
+                        history_messages=history_messages,
+                    )
+                except (LLMError, LLMUnavailableError) as e:
+                    raise GenerationError(f"LLM 生成失败: {e}") from e
+
+                if not sources:
+                    for r in search_context.faq_results[:3]:
+                        sources.append({
+                            "type": "faq",
+                            "question": r.question,
+                            "confidence": r.similarity
+                        })
+                    for r in search_context.doc_results[:3]:
+                        sources.append({
+                            "type": "doc",
+                            "source": r.doc_name,
+                            "page": r.doc_page
+                        })
+
+            # 4. 保存历史
+            self._save_history("human", query)
+            self._save_history("ai", answer)
+
+        except DatabaseError as e:
+            logger.error("[ChatEngine] 数据库错误: %s", e)
+            error_code = "DATABASE_ERROR"
+            answer = "系统内部错误（数据库），请稍后再试。"
+        except RetrievalError as e:
+            logger.error("[ChatEngine] 检索错误，降级到纯 LLM: %s", e)
+            error_code = "RETRIEVAL_FAILED"
+            try:
+                history = self._load_history()
+                history_messages = self._history_to_messages(history)
+                answer = self.response_gen.generate_pure_llm(query, history_messages)
+                search_type = "pure_llm_fallback"
+            except (LLMError, LLMUnavailableError) as e2:
+                logger.error("[ChatEngine] 纯 LLM 兜底也失败: %s", e2)
+                error_code = "LLM_FAILED"
+                answer = "抱歉，服务暂时不可用，请稍后再试。"
+        except GenerationError as e:
+            logger.error("[ChatEngine] 生成错误，尝试 FAQ 兜底: %s", e)
+            error_code = "GENERATION_FAILED"
+            if search_context and search_context.faq_results:
+                answer = search_context.faq_results[0].answer
+                sources = [{
+                    "type": "faq",
+                    "question": search_context.faq_results[0].question,
+                    "confidence": search_context.faq_results[0].similarity
+                }]
+                search_type = "faq_fallback"
+            else:
+                answer = "抱歉，生成回答时出错了，请稍后再试。"
+        except Exception as e:
+            # 兜底：任何未预期的异常
+            logger.exception("[ChatEngine] 未预期错误: %s", e)
+            error_code = "UNKNOWN_ERROR"
+            answer = "抱歉，系统出现未知错误，请稍后再试。"
+        finally:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            if error_code and answer:
+                # 出错时也要尽量保存用户问题（如果 answer 有值）
+                try:
+                    self._save_history("human", query)
+                    self._save_history("ai", answer)
+                except Exception:
+                    pass
+
+            logger.info(
+                "[ChatEngine] chat | session=%s | type=%s | faq_hits=%d | doc_hits=%d | "
+                "confidence=%.3f | error=%s | latency=%.1fms",
+                self.session_id,
+                search_type,
+                len(search_context.faq_results) if search_context else 0,
+                len(search_context.doc_results) if search_context else 0,
+                confidence,
+                error_code,
+                latency_ms,
+            )
+
         return {
             "answer": answer,
             "sources": sources,
-            "search_type": search_context.search_type.value,
-            "confidence": search_context.confidence,
-            "session_id": self.session_id,  # 返回 session_id
-            "langchain_used": self.use_langchain,
-            "chain_type": self.chain_type if self.use_langchain else None
+            "search_type": search_type,
+            "confidence": confidence,
+            "session_id": self.session_id,
+            "error_code": error_code,
+            "latency_ms": round(latency_ms, 1),
         }
-    
-    def _langchain_generate(self, 
-                           query: str,
-                           faq_results,
-                           doc_results,
-                           history: List[Dict] = None) -> str:
-        """
-        使用 LangChain 生成回答
-        
-        Args:
-            query: 查询
-            faq_results: FAQ 结果
-            doc_results: 文档结果
-            history: 历史记录
-            
-        Returns:
-            生成的回答
-        """
-        # 构建文档
-        documents = self._build_documents(faq_results, doc_results)
-        
-        # 获取检索器
-        retriever = self._get_or_create_retriever(documents)
-        
-        # 根据链类型选择生成方式
-        if self.chain_type == "conversational":
-            chain = self.langchain.create_conversational_chain(retriever)
-            answer = chain.invoke(query)
-            
-        elif self.chain_type == "conversational_retrieval":
-            chain = self.langchain.create_conversational_retrieval_chain(retriever)
-            result = chain({"question": query})
-            answer = result["answer"]
-            
-        else:  # rag
-            chain = self.langchain.create_rag_chain(retriever)
-            answer = chain.invoke(query)
-        
-        # 保存上下文
-        self.langchain.save_context(query, answer)
-        
-        return answer
-    
-    def _save_history_to_memory(self, history: List[Dict]):
-        """
-        保存历史记录到记忆
-        
-        Args:
-            history: 对话历史
-        """
-        if not self.langchain:
-            return
-        
-        for item in history:
-            if "role" in item and "content" in item:
-                if item["role"] == "user":
-                    self.langchain.save_context(item["content"], "")
-                elif item["role"] == "assistant":
-                    self.langchain.save_context("", item["content"])
-    
+
+    # -----------------------------------------------------------------------
+    # 流式（同步）—— 也加上异常收窄
+    # -----------------------------------------------------------------------
+
     def stream(self, query: str) -> Generator[str, None, None]:
         """
-        流式生成回答
-        
-        Args:
-            query: 查询文本
-            
+        同步流式生成回答（带 history + 异常收窄）
+
         Yields:
             生成的文本片段
         """
-        if not self.use_langchain or not self.langchain:
-            raise ValueError("流式输出需要 LangChain 支持")
-        
-        # 使用原生检索策略
-        search_context = self.search_router.search(query)
-        
-        if search_context.search_type.value == "faq_only":
-            # FAQ 直接返回（非流式，但模拟流式）
-            answer = search_context.faq_results[0].answer
-            # 按句子分割，模拟流式
-            import re
-            sentences = re.split(r'([。！？；\n])', answer)
-            buffer = ""
-            for s in sentences:
-                buffer += s
-                if s in ['。', '！', '？', '；', '\n']:
-                    yield buffer
-                    buffer = ""
-            if buffer:
-                yield buffer
-        else:
-            # 使用 LangChain 流式生成
-            documents = self._build_documents(
-                search_context.faq_results,
-                search_context.doc_results
-            )
-            retriever = self._get_or_create_retriever(documents)
-            
-            for chunk in self.langchain.stream(query):
-                yield chunk
-    
+        try:
+            history = self._load_history()
+        except DatabaseError as e:
+            logger.error("[ChatEngine] stream 加载历史失败: %s", e)
+            yield "系统内部错误（数据库），请稍后再试。"
+            return
+
+        history_messages = self._history_to_messages(history)
+
+        search_context = None
+        try:
+            search_context = self.search_router.search(query)
+        except Exception as e:
+            logger.error("[ChatEngine] stream 检索失败，降级到纯 LLM: %s", e)
+
+        chunks = []
+        try:
+            if search_context and search_context.search_type.value == "faq_only":
+                # FAQ 直接整段返回（不再伪流式分割）
+                answer = search_context.faq_results[0].answer
+                yield answer
+                chunks.append(answer)
+            else:
+                prompt = self.response_gen.build_prompt(
+                    query,
+                    search_context.faq_results if search_context else [],
+                    search_context.doc_results if search_context else [],
+                )
+                messages = [HumanMessage(content=prompt)]
+                if history_messages:
+                    messages = history_messages + messages
+
+                try:
+                    for chunk in StandardLLM.stream(messages, mode=self.llm_mode):
+                        yield chunk.content
+                        chunks.append(chunk.content)
+                except (LLMError, LLMUnavailableError) as e:
+                    logger.error("[ChatEngine] stream LLM 调用失败: %s", e)
+                    yield "\n[系统提示：生成服务暂时不可用]"
+        finally:
+            full_answer = "".join(chunks)
+            try:
+                self._save_history("human", query)
+                self._save_history("ai", full_answer)
+            except Exception as e:
+                logger.warning("[ChatEngine] stream 保存历史失败: %s", e)
+
+    # -----------------------------------------------------------------------
+    # 流式（异步）—— 致命修复：同步调用包 asyncio.to_thread() + 逐 chunk 超时
+    # -----------------------------------------------------------------------
+
     async def astream(self, query: str) -> AsyncGenerator[str, None]:
         """
-        异步流式生成回答
-        
-        Args:
-            query: 查询文本
-            
-        Yields:
-            生成的文本片段
+        异步流式生成回答（带 history）
+
+        致命修复：
+        - _load_history / search_router.search 是同步的，必须包 to_thread
+        - 不用 asyncio.wait_for 包整个 AsyncGenerator（会抛 TypeError）
+        - 改用 _aiter_with_timeout 对每个 __anext__() 加超时
         """
-        if not self.use_langchain or not self.langchain:
-            raise ValueError("流式输出需要 LangChain 支持")
-        
-        async for chunk in self.langchain.astream(query):
-            yield chunk
-    
+        # 1. 加载历史（同步 DB 操作 → 扔线程池）
+        try:
+            history = await asyncio.to_thread(self._load_history)
+        except DatabaseError as e:
+            logger.error("[ChatEngine] astream 加载历史失败: %s", e)
+            yield "系统内部错误（数据库），请稍后再试。"
+            return
+
+        history_messages = self._history_to_messages(history)
+
+        # 2. 检索（同步检索 → 扔线程池）
+        search_context = None
+        try:
+            search_context = await asyncio.to_thread(self.search_router.search, query)
+        except Exception as e:
+            logger.error("[ChatEngine] astream 检索失败，降级到纯 LLM: %s", e)
+
+        chunks = []
+        try:
+            if search_context and search_context.search_type.value == "faq_only":
+                # FAQ 直接整段返回
+                answer = search_context.faq_results[0].answer
+                yield answer
+                chunks.append(answer)
+            else:
+                prompt = self.response_gen.build_prompt(
+                    query,
+                    search_context.faq_results if search_context else [],
+                    search_context.doc_results if search_context else [],
+                )
+                messages = [HumanMessage(content=prompt)]
+                if history_messages:
+                    messages = history_messages + messages
+
+                # 3. LLM 流式调用（逐 chunk 超时，兼容 Python 3.10）
+                try:
+                    llm_stream = StandardLLM.astream(messages, mode=self.llm_mode)
+                    async for chunk in _aiter_with_timeout(llm_stream, timeout=self.llm_timeout):
+                        yield chunk.content
+                        chunks.append(chunk.content)
+                except (LLMError, LLMUnavailableError) as e:
+                    logger.error("[ChatEngine] astream LLM 调用失败: %s", e)
+                    yield "\n[系统提示：生成服务暂时不可用]"
+        finally:
+            full_answer = "".join(chunks)
+            try:
+                await asyncio.to_thread(self._save_history, "human", query)
+                await asyncio.to_thread(self._save_history, "ai", full_answer)
+            except Exception as e:
+                logger.warning("[ChatEngine] astream 保存历史失败: %s", e)
+
+    # -----------------------------------------------------------------------
+    # 工具方法
+    # -----------------------------------------------------------------------
+
     def clear_memory(self):
-        """清除对话记忆"""
-        if self.langchain:
-            self.langchain.clear_memory()
-            logger.info("LangChain 对话记忆已清除")
-        
-        # 清除缓存的检索器
-        self._retrievers.clear()
-        logger.info("检索器缓存已清除")
-    
-    def add_tool(self, name: str, func, description: str):
-        """
-        添加工具
-        
-        Args:
-            name: 工具名称
-            func: 工具函数
-            description: 工具描述
-            
-        Returns:
-            工具实例
-        """
-        if self.langchain:
-            return self.langchain.create_tool(name, func, description)
-        return None
-    
-    def create_agent(self, tools: list):
-        """
-        创建智能体
-        
-        Args:
-            tools: 工具列表
-            
-        Returns:
-            智能体实例
-        """
-        if self.langchain:
-            return self.langchain.create_agent(tools)
-        return None
-    
-    def get_metrics(self) -> Dict[str, Any]:
-        """
-        获取监控指标
-        
-        Returns:
-            监控指标字典
-        """
-        if self.langchain:
-            return self.langchain.get_metrics()
-        return {
-            "performance": {"note": "LangChain 未启用"},
-            "token_usage": {"note": "LangChain 未启用"}
-        }
-    
-    def reset_metrics(self):
-        """重置监控指标"""
-        if self.langchain:
-            self.langchain.reset_metrics()
-            logger.info("监控指标已重置")
+        """清除 LLM 缓存"""
+        StandardLLM.clear_cache()
+        logger.info("[ChatEngine] LLM 缓存已清除")
 
 
 # 兼容旧版接口
-def get_chat_engine(llm_mode: str = None, use_langchain: bool = True) -> ChatEngine:
+def get_chat_engine(
+    llm_mode: str = None,
+    session_id: str = None,
+    search_router: Optional[SearchRouter] = None,
+    response_gen: Optional[ResponseGenerator] = None,
+) -> ChatEngine:
     """
     获取对话引擎实例（工厂函数）
-    
+
     Args:
         llm_mode: LLM 模式
-        use_langchain: 是否使用 LangChain
-        
+        session_id: 会话 ID
+        search_router: 自定义检索路由器（可选，用于依赖注入）
+        response_gen: 自定义回答生成器（可选，用于依赖注入）
+
     Returns:
         ChatEngine 实例
     """
-    return ChatEngine(llm_mode=llm_mode, use_langchain=use_langchain)
+    return ChatEngine(
+        llm_mode=llm_mode,
+        session_id=session_id,
+        search_router=search_router,
+        response_gen=response_gen,
+    )

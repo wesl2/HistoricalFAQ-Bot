@@ -7,7 +7,7 @@
 """
 
 from .pg_config import PG_URL, PG_TABLE_NAME, VECTOR_DIM, BATCH_SIZE
-from .model_config import LLM_CONFIG, EMBEDDING_CONFIG
+from .model_config_practice import LLM_CONFIG, EMBEDDING_CONFIG
 from .retrieval_config import RETRIEVAL_CONFIG
 
 __all__ = [

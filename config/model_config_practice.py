@@ -78,73 +78,91 @@ BM25_CONFIG = {
 LLM_CONFIG = {
     "default_mode": os.getenv("LLM_MODE", "local"),
 
-    # 本地模型配置（Qwen/Llama 等）
+    # -------------------------------------------------------------------------
+    # 本地模型配置（vLLM 服务）
+    # -------------------------------------------------------------------------
+    # 注意：改用 vLLM 后，模型由独立的推理服务托管，不再在本进程加载权重。
+    # 这里的配置本质是"连接本地 vLLM 服务的客户端参数"，跟 API 模式结构一致。
     "local": {
-        # 模型路径
-        "model_path": os.getenv(
-            "LOCAL_LLM_PATH",
-            "/root/autodl-tmp/models/qwen/Qwen1.5-7B-Chat"
+        # vLLM 服务地址（OpenAI-compatible API）
+        "base_url": os.getenv(
+            "LOCAL_LLM_BASE_URL",
+            "http://localhost:8000/v1"
         ),
-        
-        # 计算设备
-        "device": os.getenv("LOCAL_LLM_DEVICE", "cuda"),
-        
-        # 设备映射方式
-        # "auto": 自动分配到多卡
-        # "cuda:0": 强制单卡
-        "device_map": os.getenv("LOCAL_LLM_DEVICE_MAP", "auto"),
-        
-        # 数据类型
-        # torch.float16: 半精度，省显存
-        # torch.bfloat16: 更好的数值稳定性
-        # torch.float32: 全精度，质量最好但慢
-        "torch_dtype": "float16",
-        
-        # 生成参数
-        "max_new_tokens": int(os.getenv("LOCAL_LLM_MAX_TOKENS", "512")),
-        "temperature": float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.7")),
-        "do_sample": True,
-        "top_p": 0.9,
-        "top_k": 50,
 
-        # 系统提示词（历史人物专家）
-        "system_prompt": """你是一位专业的中国现代史研究专家，尤其擅长"四人帮"相关历史。
-        你需要基于提供的参考资料回答用户关于历史人物的问题。
-        要求：
-        1. 回答必须基于提供的资料，不要编造
-        2. 保持客观中立的历史态度
-        3. 如果资料不足以回答，请明确说明"根据现有资料无法确定"
-        4. 适当引用资料来源"""
+        # API Key（vLLM 默认不校验，随便填）
+        "api_key": os.getenv("LOCAL_LLM_API_KEY", "not-needed"),
+
+        # 模型名称（vLLM 启动时 --model 或 --served-model-name 指定的名称）
+        "model": os.getenv("LOCAL_LLM_MODEL_NAME", "qwen-7b-chat"),
+
+        # 生成参数（OpenAI API 标准字段名）
+        "temperature": float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.7")),
+        "max_tokens": int(os.getenv("LOCAL_LLM_MAX_TOKENS", "512")),
+        "top_p": 0.9,
+
+        # 连接控制
+        "timeout": int(os.getenv("LOCAL_LLM_TIMEOUT", "120")),
+        "max_retries": int(os.getenv("LOCAL_LLM_MAX_RETRIES", "2")),
+
+
     },
-    
+
+    # -------------------------------------------------------------------------
     # API 模型配置（OpenAI/DeepSeek/Claude 等）
-    "api":{
-        # API 类型（openai/deepseek/claude）
-        "api_type": os.getenv("API_LLM_TYPE", "openai"),
-        # OpenAI API 配置
-        "openai": {
-            "model": os.getenv("OPENAI_MODEL", "gpt-4-0613"),
-            "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
-            "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "512")),
-            "top_p": 0.9,
-            "top_k": 50,
-        },
-        # DeepSeek API 配置
-        "deepseek": {
-            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-3.5"),
-            "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE", "0.7")),
-            "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "512")),
-            "top_p": 0.9,
-            "top_k": 50,
-        },
-        # Claude API 配置
-        "claude": {
-            "model": os.getenv("CLAUDE_MODEL", "claude-2"),
-            "temperature": float(os.getenv("CLAUDE_TEMPERATURE", "0.7")),
-            "max_tokens": int(os.getenv("CLAUDE_MAX_TOKENS", "512")),
-            "top_p": 0.9,
-            "top_k": 50,
-    },
-      
+    # -------------------------------------------------------------------------
+    # 结构跟 local 保持一致，方便统一用 ChatOpenAI 初始化。
+    # 如果没填 base_url，standard_llm_new.py 会根据 provider 自动补全。
+    "api": {
+        # 服务商标识（用于自动补全 base_url 和 model，可选）
+        "provider": os.getenv("API_PROVIDER", "deepseek"),
+
+        # API 密钥
+        "api_key": os.getenv("API_KEY", ""),
+
+        # 自定义 base_url（如果填了就直接用，不读 provider 默认值）
+        "base_url": os.getenv("API_BASE_URL", ""),
+
+        # 自定义模型名（如果填了就直接用，不读 provider 默认值）
+        "model": os.getenv("API_MODEL", ""),
+
+        # 生成参数
+        "temperature": float(os.getenv("API_TEMPERATURE", "0.7")),
+        "max_tokens": int(os.getenv("API_MAX_TOKENS", "512")),
+        "top_p": 0.9,
+
+        # 连接控制
+        "timeout": int(os.getenv("API_LLM_TIMEOUT", "60")),
+        "max_retries": int(os.getenv("API_LLM_MAX_RETRIES", "2")),
+
+
+    }
 }
+
+
+# =============================================================================
+# 厂商特定的 API 默认配置（base_url + model）
+# =============================================================================
+# standard_llm_new.py 里，如果 api 配置没填 base_url/model，就从这里补。
+API_PROVIDER_CONFIG = {
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-3.5-turbo"
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat"
+    },
+    "claude": {
+        "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-3-sonnet-20240229"
+    },
+    "zhipu": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4"
+    },
+    "moonshot": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "model": "moonshot-v1-8k"
+    }
 }

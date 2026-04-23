@@ -1,28 +1,55 @@
+# =============================================================================
+# HistoricalFAQ-Bot 依赖清单
+# =============================================================================
+# 生成方式：pipreqs 分析 + 实际环境版本校验 + 手动剔除未引用包
+#
+# 变更说明：
+#   1. 删除了项目代码中未引用的包（chromadb/faiss/llama-index/pypdf2 等早期实验残留）
+#   2. 删除了 langchain/langchain-community/langchain-text-splitters/langchain-huggingface
+#      （代码中未直接 import，且与 langchain-core 1.x 存在版本冲突）
+#   3. 保留了 langchain-core + langchain-openai（StandardLLM 实际依赖）
+#   4. 删除了 pgvector Python 包（pgvector 是 PostgreSQL 扩展，在数据库端安装即可）
+#
+# 安装方式：
+#   pip install -r requirements.txt
+#
+# 注意：默认安装 torch CUDA 版（CUDA 11.8），如需 CPU 版请手动修改
+# =============================================================================
+
+# --- PyTorch CUDA 源 ---
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# --- Web 服务 ---
 fastapi==0.104.1
 uvicorn==0.24.0
-pydantic==2.5.0
-pydantic-settings==2.1.0
-langchain==0.2.0
-langchain-core==0.2.0
-langchain-community==0.2.0
-langchain-huggingface==0.0.3
-langchain-text-splitters==0.2.0
-llama-index==0.10.0
-llama-index-core==0.10.0
-llama-index-embeddings-huggingface==0.1.5
-llama-index-readers-file==0.10.0
-BCEmbedding==0.1.0
-torch==2.1.0
-transformers==4.35.0
-sentence-transformers==2.2.2
-PyPDF2==3.0.1
-psycopg2-binary==2.9.9
-pgvector==0.2.4
-numpy==1.24.3
-loguru==0.7.2
-pytest==7.4.3
-requests==2.31.0
-python-multipart==0.0.6
-chromadb==0.4.24
-faiss-cpu==1.7.4
+
+# --- 数据校验 ---
+pydantic==2.13.3
+
+# --- LangChain 核心（精简版，避免版本冲突） ---
+# 只保留代码中实际 import 的模块
+langchain-core==1.3.0
+langchain-openai==1.1.16
+
+# --- LLM / API ---
+openai==2.30.0
+httpx==0.27.0
+tenacity==8.5.0
+requests==2.32.3
+
+# --- Embedding / 深度学习 ---
+torch==2.1.2
+# transformers 和 sentence-transformers 版本关联紧密，放宽限制让 pip 自动解析
+transformers>=4.35.0
+sentence-transformers>=2.2.0
+numpy==1.26.4
+
+# --- 检索 ---
 rank-bm25==0.2.2
+jieba==0.42.1
+
+# --- 数据库 ---
+psycopg2-binary==2.9.9
+
+# --- 日志 ---
+loguru==0.7.3

@@ -14,7 +14,7 @@ from transformers import pipeline, TextIteratorStreamer
 import torch
 from threading import Thread
 
-from config.model_config import LLM_CONFIG
+from config.model_config_practice import LLM_CONFIG
 
 logger = None  # 延迟导入，避免循环依赖
 

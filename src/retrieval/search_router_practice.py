@@ -36,8 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 #   from .doc_retriever_practice import DocResult, DocRetriever
 # 思考：为什么用相对导入（.xxx）？因为 search_router 和检索器在同一包内
 
-from faq_retriever_practice import FAQResult, FAQRetriever
-from doc_retriever_practice import DocResult, DocRetriever
+from src.retrieval.faq_retriever_practice import FAQResult, FAQRetriever
+from src.retrieval.doc_retriever_practice import DocResult, DocRetriever
 
 
 # =============================================================================
