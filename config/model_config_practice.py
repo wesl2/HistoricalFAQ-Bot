@@ -127,7 +127,7 @@ LLM_CONFIG = {
         "model": os.getenv("API_MODEL", ""),
 
         # 生成参数
-        "temperature": float(os.getenv("API_TEMPERATURE", "0.7")),
+        "temperature": float(os.getenv("API_TEMPERATURE", "0.0")),
         "max_tokens": int(os.getenv("API_MAX_TOKENS", "512")),
         "top_p": 0.9,
 

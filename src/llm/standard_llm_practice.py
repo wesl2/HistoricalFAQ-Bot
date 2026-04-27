@@ -46,10 +46,10 @@ Event Loop 通过监听 IO Event 来决定该唤醒哪个 Task。"
 # TODO 1.1: 在这里写下所有 import
 # ...
 import asyncio,os,threading
-from typing import Optional, AsyncIterator, List,Union
+from typing import Optional, AsyncIterator, List, Union
 import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI #实现的BaseChatModel
 from langchain_core.language_models import BaseChatModel
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential

@@ -25,6 +25,7 @@ from src.retrieval.doc_retriever_practice import DocRetriever
 from src.llm.standard_llm_new import LLMError, LLMUnavailableError, StandardLLM
 from src.chat.response_generator import ResponseGenerator
 from src.vectorstore.pg_pool_practice import get_cursor
+from src.embedding.embedding_local_practice import get_embedding as _shared_get_embedding
 from config.pg_config import PG_CHAT_TABLE
 
 logger = logging.getLogger(__name__)
@@ -136,12 +137,14 @@ class ChatEngine:
     @staticmethod
     def _default_search_router() -> SearchRouter:
         """构建默认的 SearchRouter（内部组装 FAQ + Doc 检索器）"""
-        faq_retriever = FAQRetriever(top_k=3)
+        # 统一注入共享的 embedding 函数，避免重复加载模型
+        faq_retriever = FAQRetriever(top_k=3, embedding_fn=_shared_get_embedding)
         doc_retriever = DocRetriever(
             top_k=10,
             use_bm25=True,
             fusion_method="rrf",
-            rrf_k=60
+            rrf_k=60,
+            embedding_fn=_shared_get_embedding,
         )
         return SearchRouter(
             faq_retriever=faq_retriever,
@@ -232,6 +235,72 @@ class ChatEngine:
     # 核心对话方法（同步）
     # -----------------------------------------------------------------------
 
+    def _rewrite_query(self, query: str, history: List[Dict[str, str]]) -> str:
+        """
+        【P0: Query Rewriting / 指代消解】
+        根据对话历史改写当前查询，消除指代歧义（他/她/这/那）。
+        如果查询已经明确或没有历史，直接原样返回。
+        """
+        if not history:
+            return query
+
+        # 取最近 3 轮对话作为上下文
+        history_text = "\n".join([
+            f"{'用户' if h['role'] == 'human' else 'AI'}：{h['content'][:100]}"
+            for h in history[-3:]
+        ])
+
+        prompt = f"""请根据以下对话历史，改写当前用户查询，消除指代歧义（如"他/她/它/这/那"等）。
+如果当前查询已经明确具体，无需改写，请直接原样返回。
+
+对话历史：
+{history_text}
+
+当前查询：{query}
+
+改写后的查询（只输出改写结果，不要解释）："""
+
+        try:
+            # 【注意】这里用同步 invoke，因为 chat() 是同步方法
+            resp = StandardLLM.invoke(prompt, mode=self.llm_mode)
+            rewritten = resp.content.strip()
+            if rewritten and rewritten != query:
+                logger.info("[ChatEngine] Query Rewriting: '%s' → '%s'", query, rewritten)
+            return rewritten if rewritten else query
+        except Exception as e:
+            logger.warning("[ChatEngine] Query Rewriting 失败: %s，回退到原查询", e)
+            return query
+
+    async def _arewrite_query(self, query: str, history: List[Dict[str, str]]) -> str:
+        """异步版本的 Query Rewriting"""
+        if not history:
+            return query
+
+        history_text = "\n".join([
+            f"{'用户' if h['role'] == 'human' else 'AI'}：{h['content'][:100]}"
+            for h in history[-3:]
+        ])
+
+        prompt = f"""请根据以下对话历史，改写当前用户查询，消除指代歧义（如"他/她/它/这/那"等）。
+如果当前查询已经明确具体，无需改写，请直接原样返回。
+
+对话历史：
+{history_text}
+
+当前查询：{query}
+
+改写后的查询（只输出改写结果，不要解释）："""
+
+        try:
+            resp = await StandardLLM.ainvoke(prompt, mode=self.llm_mode)
+            rewritten = resp.content.strip()
+            if rewritten and rewritten != query:
+                logger.info("[ChatEngine] Query Rewriting: '%s' → '%s'", query, rewritten)
+            return rewritten if rewritten else query
+        except Exception as e:
+            logger.warning("[ChatEngine] Query Rewriting 失败: %s，回退到原查询", e)
+            return query
+
     def chat(self, query: str) -> Dict[str, Any]:
         """
         处理用户查询（标准模式，带 history + 兜底 + 耗时统计）
@@ -240,6 +309,7 @@ class ChatEngine:
             {
                 "answer": str,
                 "sources": list,
+                "citations": list,  # 【P0: 引用溯源】
                 "search_type": str,
                 "confidence": float,
                 "session_id": str,
@@ -251,6 +321,7 @@ class ChatEngine:
         error_code = None
         answer = ""
         sources = []
+        citations = []  # 【P0: 引用溯源】
         search_type = "unknown"
         confidence = 0.0
         search_context = None
@@ -260,9 +331,12 @@ class ChatEngine:
             history = self._load_history()
             history_messages = self._history_to_messages(history)
 
-            # 2. 检索
+            # 2. 【P0: Query Rewriting】改写查询，消除指代歧义
+            rewritten_query = self._rewrite_query(query, history)
+
+            # 3. 检索（用改写后的 query）
             try:
-                search_context = self.search_router.search(query)
+                search_context = self.search_router.search(rewritten_query)
                 search_type = search_context.search_type.value
                 confidence = search_context.confidence
             except Exception as e:
@@ -361,9 +435,14 @@ class ChatEngine:
                 latency_ms,
             )
 
+        # 【P0: 引用溯源】解析回答中的引用标记
+        if answer:
+            citations = self.response_gen.extract_citations(answer)
+
         return {
             "answer": answer,
             "sources": sources,
+            "citations": citations,  # 【P0: 引用溯源】
             "search_type": search_type,
             "confidence": confidence,
             "session_id": self.session_id,
@@ -391,9 +470,12 @@ class ChatEngine:
 
         history_messages = self._history_to_messages(history)
 
+        # 【P0: Query Rewriting】
+        rewritten_query = self._rewrite_query(query, history)
+
         search_context = None
         try:
-            search_context = self.search_router.search(query)
+            search_context = self.search_router.search(rewritten_query)
         except Exception as e:
             logger.error("[ChatEngine] stream 检索失败，降级到纯 LLM: %s", e)
 
@@ -405,24 +487,24 @@ class ChatEngine:
                 yield answer
                 chunks.append(answer)
             else:
-                prompt = self.response_gen.build_prompt(
-                    query,
-                    search_context.faq_results if search_context else [],
-                    search_context.doc_results if search_context else [],
-                )
-                messages = [HumanMessage(content=prompt)]
-                if history_messages:
-                    messages = history_messages + messages
-
                 try:
-                    for chunk in StandardLLM.stream(messages, mode=self.llm_mode):
-                        yield chunk.content
-                        chunks.append(chunk.content)
+                    for chunk in self.response_gen.generate_stream(
+                        query,
+                        search_context.faq_results if search_context else [],
+                        search_context.doc_results if search_context else [],
+                        history_messages,
+                    ):
+                        yield chunk
+                        chunks.append(chunk)
                 except (LLMError, LLMUnavailableError) as e:
                     logger.error("[ChatEngine] stream LLM 调用失败: %s", e)
                     yield "\n[系统提示：生成服务暂时不可用]"
         finally:
             full_answer = "".join(chunks)
+            # 【P0: 引用溯源】解析引用标记（仅用于日志记录，流式接口不返回结构）
+            citations = self.response_gen.extract_citations(full_answer)
+            if citations:
+                logger.info("[ChatEngine] stream citations: %s", [c["id"] for c in citations])
             try:
                 self._save_history("human", query)
                 self._save_history("ai", full_answer)
@@ -452,10 +534,16 @@ class ChatEngine:
 
         history_messages = self._history_to_messages(history)
 
-        # 2. 检索（同步检索 → 扔线程池）
+        # 2. 【P0: Query Rewriting】改写查询
+        rewritten_query = await self._arewrite_query(query, history)
+
+        # 3. 检索（优先使用异步接口 asearch，回退到 to_thread 包 search）
         search_context = None
         try:
-            search_context = await asyncio.to_thread(self.search_router.search, query)
+            if hasattr(self.search_router, "asearch"):
+                search_context = await self.search_router.asearch(rewritten_query)
+            else:
+                search_context = await asyncio.to_thread(self.search_router.search, rewritten_query)
         except Exception as e:
             logger.error("[ChatEngine] astream 检索失败，降级到纯 LLM: %s", e)
 
@@ -467,26 +555,26 @@ class ChatEngine:
                 yield answer
                 chunks.append(answer)
             else:
-                prompt = self.response_gen.build_prompt(
-                    query,
-                    search_context.faq_results if search_context else [],
-                    search_context.doc_results if search_context else [],
-                )
-                messages = [HumanMessage(content=prompt)]
-                if history_messages:
-                    messages = history_messages + messages
-
                 # 3. LLM 流式调用（逐 chunk 超时，兼容 Python 3.10）
                 try:
-                    llm_stream = StandardLLM.astream(messages, mode=self.llm_mode)
+                    llm_stream = self.response_gen.agenerate_stream(
+                        query,
+                        search_context.faq_results if search_context else [],
+                        search_context.doc_results if search_context else [],
+                        history_messages,
+                    )
                     async for chunk in _aiter_with_timeout(llm_stream, timeout=self.llm_timeout):
-                        yield chunk.content
-                        chunks.append(chunk.content)
+                        yield chunk
+                        chunks.append(chunk)
                 except (LLMError, LLMUnavailableError) as e:
                     logger.error("[ChatEngine] astream LLM 调用失败: %s", e)
                     yield "\n[系统提示：生成服务暂时不可用]"
         finally:
             full_answer = "".join(chunks)
+            # 【P0: 引用溯源】
+            citations = self.response_gen.extract_citations(full_answer)
+            if citations:
+                logger.info("[ChatEngine] astream citations: %s", [c["id"] for c in citations])
             try:
                 await asyncio.to_thread(self._save_history, "human", query)
                 await asyncio.to_thread(self._save_history, "ai", full_answer)

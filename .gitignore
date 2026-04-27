@@ -63,3 +63,6 @@ Thumbs.db
 .opencode/
 .qwen/
 .opencode
+
+# Local test scripts with secrets
+src/llm/llm_test.py

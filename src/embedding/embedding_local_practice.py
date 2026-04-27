@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from typing import Union, List
 from transformers import AutoTokenizer, AutoModel
-from config.model_config import EMBEDDING_CONFIG
+from config.model_config_practice import EMBEDDING_CONFIG
 
 
 # 使用 logging.getLogger(__name__) 创建 logger

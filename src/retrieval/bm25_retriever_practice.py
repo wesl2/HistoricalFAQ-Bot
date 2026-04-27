@@ -178,9 +178,7 @@ class BM25Retriever:
         tokenized_query = list(jieba.cut(query))
         # BM25 打分
         scores = self.bm25.get_scores(tokenized_query)
-        print(f"查询: {query}")
-        print(f"分数: {scores}")  # 看看分数是多少
-        print(f"最高分: {max(scores) if len(scores) > 0 else 'N/A'}")
+        logger.debug("BM25 查询: %s | 最高分: %s", query, max(scores) if len(scores) > 0 else 'N/A')
         # 取 Top-K
         # 使用 argsort 获取排序索引
         # 通过 BM25 获取的是分数  ， np.argsort(scores) 返回的才是索引

@@ -34,7 +34,7 @@ from src.data_pipeline.document_processor import DocumentProcessor
 # from src.rag.advanced_retriever import get_advanced_retriever
 from langchain_community.vectorstores import Chroma, FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from config.model_config import EMBEDDING_CONFIG, LANGCHAIN_CONFIG
+from config.model_config_practice import EMBEDDING_CONFIG, LANGCHAIN_CONFIG
 
 
 def process_single_file(

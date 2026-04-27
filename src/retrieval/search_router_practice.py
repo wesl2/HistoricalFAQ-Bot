@@ -24,6 +24,7 @@
 #   - typing: 类型提示（List, Optional 等，提升代码可读性）
 #   - dataclasses: 数据类（dataclass, field，简化数据容器定义）
 
+import asyncio
 import logging
 from enum import Enum
 from typing import List, NamedTuple, Optional
@@ -131,22 +132,27 @@ class SearchRouter:
         self,
         faq_retriever: FAQRetriever,
         doc_retriever: DocRetriever,
-        high_threshold: float = 0.78,
-        low_threshold: float = 0.65,
+        high_threshold: float = 0.82,
+        executor: Optional[ThreadPoolExecutor] = None,
     ):
         """
         初始化路由器
         
         Args:
+            faq_retriever: FAQ 检索器实例
+            doc_retriever: 文档检索器实例
             high_threshold: 高置信度阈值。FAQ 最高相似度 ≥ 此值时，
                            认为 FAQ 足以回答，直接返回 FAQ 结果。
-            low_threshold: 低置信度阈值。FAQ 最高相似度 < 此值时，
-                          认为 FAQ 不够可靠，需要走文档检索补充。
+            executor: 外部线程池（可选）。生产环境建议传入全局线程池，
+                      避免每次检索都新建线程池。
         """
         self.faq_retriever = faq_retriever 
         self.doc_retriever = doc_retriever
         self.high_threshold = high_threshold
-        self.low_threshold = low_threshold
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="search_router"
+        )
+        self._own_executor = executor is None
     
     def _retrieve_faq(self, query: str) -> List[FAQResult]:
         """FAQ 检索包装（用于线程池提交）"""
@@ -157,36 +163,20 @@ class SearchRouter:
         return self.doc_retriever.retrieve(query)
 
     
-    def search(self, query: str) -> SearchContext:
-        start_time = time.perf_counter()
-        faq_results : List[FAQResult] = []
-        doc_results : List[DocResult] = []
-
-        with ThreadPoolExecutor() as executor:
-            faq_future = executor.submit(self._retrieve_faq, query)
-            doc_future = executor.submit(self._retrieve_doc, query)
-
-            try:
-                faq_results = faq_future.result()
-            except Exception as e:
-                logger.error(f"FAQ 检索失败: {e}", exc_info=True)
-                faq_results = []
-            
-            try:
-                doc_results = doc_future.result()
-            except Exception as e:
-                logger.error(f"文档检索异常: {e}", exc_info=True)
-                doc_results = []
-
-        # 步骤 2：根据 FAQ 结果做路由决策
-        latency = (time.perf_counter() - start_time) * 1000
-        
+    def _build_context(
+        self,
+        faq_results: List[FAQResult],
+        doc_results: List[DocResult],
+        latency_ms: float,
+    ) -> SearchContext:
+        """根据 FAQ + Doc 结果构建路由决策后的 SearchContext"""
         # 分支 A：FAQ 无结果 → 直接走文档检索兜底
         if not faq_results:
-            doc_conf = doc_results[0].similarity if doc_results else 0.0    
+            doc_conf = doc_results[0].similarity if doc_results else 0.0
             logger.info(
-                f"FAQ 无匹配，路由至 DOC_ONLY, "
-                f"文档最高相似度: {doc_conf:.3f}，耗时: {latency:.1f}ms"
+                "FAQ 无匹配，路由至 DOC_ONLY, "
+                "文档最高相似度: %.3f，耗时: %.1fms",
+                doc_conf, latency_ms,
             )
             return SearchContext(
                 faq_results=[],
@@ -194,13 +184,13 @@ class SearchRouter:
                 search_type=SearchType.DOC_ONLY,
                 confidence=doc_conf,
                 routing_reason="FAQ 返回空列表，fallback 至文档检索",
-                latency_ms=latency,
+                latency_ms=latency_ms,
             )
-        
+
         # 按相似度降序排列
         faq_results_sorted = sorted(faq_results, key=lambda x: x.similarity, reverse=True)
         max_similarity = faq_results_sorted[0].similarity
-        
+
         # 分支 B：高置信度 → 直接返回 FAQ 答案
         if max_similarity >= self.high_threshold:
             return SearchContext(
@@ -209,9 +199,9 @@ class SearchRouter:
                 search_type=SearchType.FAQ_ONLY,
                 confidence=max_similarity,
                 routing_reason=f"FAQ 最高相似度 {max_similarity:.3f} >= 阈值 {self.high_threshold}",
-                latency_ms=latency,
+                latency_ms=latency_ms,
             )
-        
+
         # 分支 C：中低置信度 → 返回混合结果
         return SearchContext(
             faq_results=faq_results_sorted,
@@ -222,38 +212,61 @@ class SearchRouter:
                 f"FAQ 最高相似度 {max_similarity:.3f} 低于阈值 {self.high_threshold}，"
                 f"需文档补充"
             ),
-            latency_ms=latency,
+            latency_ms=latency_ms,
         )
+
+    def search(self, query: str) -> SearchContext:
+        """同步检索（复用实例级线程池，避免每次新建）"""
+        start_time = time.perf_counter()
+
+        faq_future = self._executor.submit(self._retrieve_faq, query)
+        doc_future = self._executor.submit(self._retrieve_doc, query)
+
+        try:
+            faq_results = faq_future.result()
+        except Exception as e:
+            logger.error("FAQ 检索失败: %s", e, exc_info=True)
+            faq_results = []
+
+        try:
+            doc_results = doc_future.result()
+        except Exception as e:
+            logger.error("文档检索异常: %s", e, exc_info=True)
+            doc_results = []
+
+        latency = (time.perf_counter() - start_time) * 1000
+        return self._build_context(faq_results, doc_results, latency)
+
+    async def asearch(self, query: str) -> SearchContext:
+        """异步检索（用 asyncio.to_thread 跑同步检索器，gather 并发）"""
+        start_time = time.perf_counter()
+
+        faq_task = asyncio.create_task(
+            asyncio.to_thread(self._retrieve_faq, query)
+        )
+        doc_task = asyncio.create_task(
+            asyncio.to_thread(self._retrieve_doc, query)
+        )
+
+        faq_results, doc_results = await asyncio.gather(
+            faq_task, doc_task, return_exceptions=True
+        )
+
+        if isinstance(faq_results, Exception):
+            logger.error("FAQ 检索失败: %s", faq_results, exc_info=True)
+            faq_results = []
+        if isinstance(doc_results, Exception):
+            logger.error("文档检索异常: %s", doc_results, exc_info=True)
+            doc_results = []
+
+        latency = (time.perf_counter() - start_time) * 1000
+        return self._build_context(faq_results, doc_results, latency)
     # -------------------------------------------------------------------------
     # 扩展练习（可选，⭐⭐⭐ 难度）
     # -------------------------------------------------------------------------
     def search_with_rerank(self, query: str) -> SearchContext:
         """
-        带重排序的混合检索
-        
-        TODO 5.3 ⭐⭐⭐（扩展）实现融合排序
-        
-        原始脚本的 search() 只是把 FAQ 和 RAG 结果简单拼接返回。
-        在生产环境中，通常需要对多路结果做"融合排序"：
-        
-        1. 收集 FAQ 结果（带类型标记 faq）
-        2. 收集 RAG 结果（带类型标记 rag）
-        3. 用统一标准重新排序：
-           - FAQ 结果使用 faq_similarity
-           - RAG 结果使用 doc_similarity
-           - 或者使用 RRF（Reciprocal Rank Fusion）公式融合
-        4. 取 top_k 混合返回
-        
-        这个扩展要求你深入理解：
-        - 不同检索器的分数量纲差异（FAQ 的 similarity 和 RAG 的 similarity 不是同一分布）
-        - RRF 融合公式：score = 1/(K+rank_faq) + 1/(K+rank_rag)
-        
-        提示实现思路：
-        1. faq_results = self.faq_retriever.retrieve(query)
-        2. doc_results = self.doc_retriever.retrieve(query)
-        3. 对 doc_results 按 similarity 排序，得到排名
-        4. 用 RRF 公式计算每个 doc 的融合分
-        5. 合并、排序、取 top_k
+        适用Reranker模型进行精排
         
         Args:
             query: 用户查询字符串

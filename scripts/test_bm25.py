@@ -15,7 +15,7 @@ import time
 sys.path.insert(0, '.')
 
 from src.retrieval.doc_retriever_practice import DocRetriever
-from config.model_config import BM25_CONFIG
+from config.model_config_practice import BM25_CONFIG
 
 
 def print_results(title, results, show_details=True):

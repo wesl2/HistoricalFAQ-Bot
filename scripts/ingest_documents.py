@@ -95,7 +95,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 用 try/except 做自适应导入，确保无论当前环境是哪种状态都能跑通。
 try:
     # 正式版：本地 BGE-M3 embedding 计算接口
-    from src.embedding.embedding_local import get_embedding
+    from src.embedding.embedding_local_practice import get_embedding
     # 正式版：PostgreSQL 连接池
     from src.vectorstore.pg_pool import get_connection
 except ImportError:
@@ -108,7 +108,7 @@ from src.data_pipeline.document_processor import DocumentProcessor
 
 # 配置导入：PG_DOC_TABLE 是文档片段表名，EMBEDDING_CONFIG 包含模型参数
 from config.pg_config import PG_DOC_TABLE
-from config.model_config import EMBEDDING_CONFIG
+from config.model_config_practice import EMBEDDING_CONFIG
 
 # =============================================================================
 # 第四部分：日志配置

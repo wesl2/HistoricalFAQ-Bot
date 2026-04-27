@@ -89,7 +89,8 @@ class DocRetriever:
         use_bm25: bool = True,
         bm25_weight: float = 0.3,
         fusion_method: str = "rrf",  # 【新增】融合方法：rrf 或 linear
-        rrf_k: int = 60  # 【新增】RRF 参数 K
+        rrf_k: int = 60,  # 【新增】RRF 参数 K
+        embedding_fn=None,
     ):
         """
         初始化文档检索器
@@ -100,13 +101,8 @@ class DocRetriever:
             bm25_weight: BM25 权重（仅 linear 模式使用）
             fusion_method: 融合方法 - "rrf"（推荐）或 "linear"
             rrf_k: RRF 参数 K（通常 60，仅 rrf 模式使用）
+            embedding_fn: 向量化函数（依赖注入，默认使用模块级 get_embedding）
         """
-        # TODO: 初始化实例属性
-        # 提示：
-        # 1. 将 top_k, use_bm25, bm25_weight, fusion_method, rrf_k 保存为实例属性
-        # 2. 从配置中获取 doc_table（PG_DOC_TABLE）
-        # 3. 初始化 _bm25_retriever 为 None（懒加载）
-        # 4. 如果 use_bm25 为 True，记录日志显示混合检索配置信息
         self.top_k = top_k
         self.use_bm25 = use_bm25
         self.bm25_weight = bm25_weight
@@ -114,6 +110,7 @@ class DocRetriever:
         self.rrf_k = rrf_k
         self.doc_table = PG_DOC_TABLE
         self._bm25_retriever = None
+        self.embedding_fn = embedding_fn or get_embedding
         if self.use_bm25:
             logger.info(f"Initialized DocRetriever with BM25 hybrid retrieval. "
                         f"BM25 weight: {self.bm25_weight}, Fusion method: {self.fusion_method}, RRF K: {self.rrf_k}")
@@ -175,7 +172,7 @@ class DocRetriever:
         # 5. 将查询结果转换为 DocResult 对象列表
         # 6. 记录日志并返回结果
         # 注意：记得关闭 cursor
-        query_vector = get_embedding(query)
+        query_vector = self.embedding_fn(query)
         query_str = '[' + ','.join(map(str,query_vector)) + ']'
         with get_connection() as conn:
             with conn.cursor() as cursor:

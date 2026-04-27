@@ -32,7 +32,7 @@ from typing import List, NamedTuple
 from src.vectorstore.pg_pool_practice import get_connection,get_cursor
 from config.pg_config import PG_TABLE_NAME
 from pydantic import BaseModel,Field,field_validator,ConfigDict
-from src.embedding.embedding_local import get_embedding   # 你写的本地 embedding（或 practice 版）
+from src.embedding.embedding_local_practice import get_embedding
 from psycopg2.extras import RealDictCursor
 # =============================================================================
 # TODO 2: 创建 logger
@@ -98,9 +98,9 @@ class FAQRetriever:
     核心功能：将用户问题向量化，在数据库中检索最相似的FAQ记录
     """
     
-    def __init__(self, top_k: int = 5):
-
+    def __init__(self, top_k: int = 5, embedding_fn=None):
         self.top_k = top_k
+        self.embedding_fn = embedding_fn or get_embedding
     
     def retrieve(self, query: str) -> List[FAQResult]:
         """
@@ -122,7 +122,7 @@ class FAQRetriever:
         # 步骤1：计算查询向量
         # 调用 get_embedding(query) 获取向量（1024维列表）
         # 你的代码：
-        query_vector = get_embedding(query)
+        query_vector = self.embedding_fn(query)
         query_str = '[' + ','.join(map(str,query_vector)) + ']'  # 转换为 PostgreSQL 格式字符串  
         # 步骤2：SQL 向量检索
         # 使用 with get_connection() as conn: 获取连接

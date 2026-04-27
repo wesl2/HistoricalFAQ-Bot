@@ -18,7 +18,7 @@ from collections import defaultdict
 from src.vectorstore.pg_pool import get_connection
 from src.vectorstore.pg_search import FAQSearcher, HybridSearcher
 from config.pg_config import PG_TABLE_NAME, PG_DOC_TABLE
-from config.model_config import EMBEDDING_CONFIG
+from config.model_config_practice import EMBEDDING_CONFIG
 
 logger = None
 
