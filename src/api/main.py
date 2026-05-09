@@ -1,25 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI后端服务
+FastAPI 后端服务（v2.1：按请求隔离 session，全局复用核心组件）
 
-提供历史问答API接口，支持：
-- 标准 RAG 查询
-- 流式输出
-- Agent 功能
-- 监控指标
+改动点：
+1. 去掉全局 ChatEngine 单例，避免 session_id 串台
+2. SearchRouter / ResponseGenerator 全局复用，避免 BM25 重复加载
+3. 前端传入 session_id，不传则后端自动生成
+4. 标准查询走 achat()，享受并行检索收益
 """
 
 import logging
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.chat.chat_engine import ChatEngine
-from src.tools.tools import Tools
+from src.chat.response_generator import ResponseGenerator
+from src.retrieval.search_router_practice import SearchRouter
+from src.retrieval.faq_retriever_practice import FAQRetriever
+from src.retrieval.doc_retriever_practice import DocRetriever
+from src.embedding.embedding_local_practice import get_embedding as _shared_get_embedding
 
 # 配置日志
 logging.basicConfig(
@@ -28,93 +32,80 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 创建FastAPI应用
+# 创建 FastAPI 应用
 app = FastAPI(
     title="Historical FAQ Bot API",
-    description="基于RAG架构的历史人物问答系统（支持LangChain集成、流式输出、Agent）",
-    version="2.0.0"
+    description="基于 RAG 架构的历史人物问答系统",
+    version="2.1.0"
 )
 
-# 配置CORS
+# 配置 CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应设置具体的前端域名
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==================== 初始化核心组件 ====================
+# ==================== 全局复用核心组件 ====================
+# SearchRouter 和 ResponseGenerator 无状态、线程安全，只初始化一次
 
-# 从环境变量读取配置
-use_langchain = os.getenv("USE_LANGCHAIN", "true").lower() == "true"
-use_advanced_retriever = os.getenv("USE_ADVANCED_RETRIEVER", "true").lower() == "true"
+logger.info("初始化全局核心组件...")
 
-logger.info(f"初始化服务: use_langchain={use_langchain}, use_advanced_retriever={use_advanced_retriever}")
-
-# 初始化对话引擎
-chat_engine = ChatEngine(
-    use_langchain=use_langchain,
-    use_advanced_retriever=use_advanced_retriever
+_faq_retriever = FAQRetriever(top_k=3, embedding_fn=_shared_get_embedding)
+_doc_retriever = DocRetriever(
+    top_k=10,
+    use_bm25=True,
+    fusion_method="rrf",
+    rrf_k=60,
+    embedding_fn=_shared_get_embedding,
 )
+_search_router = SearchRouter(
+    faq_retriever=_faq_retriever,
+    doc_retriever=_doc_retriever
+)
+_response_gen = ResponseGenerator()
 
-# 初始化工具和智能体
-agent = None
-if use_langchain:
-    try:
-        tools_instance = Tools(chat_engine)
-        tools = [
-            chat_engine.add_tool(
-                name=tool["name"], 
-                func=tool["func"], 
-                description=tool["description"]
-            )
-            for tool in tools_instance.get_all_tools()
-        ]
-        agent = chat_engine.create_agent(tools)
-        logger.info("Agent 初始化完成")
-    except Exception as e:
-        logger.error(f"Agent 初始化失败: {e}")
-        agent = None
+logger.info("全局核心组件初始化完成")
+
+
+def _get_chat_engine(session_id: Optional[str] = None) -> ChatEngine:
+    """
+    工厂函数：每次请求创建新的 ChatEngine（隔离 session），
+    但注入全局复用的核心组件。
+    """
+    return ChatEngine(
+        search_router=_search_router,
+        response_gen=_response_gen,
+        session_id=session_id,
+    )
+
 
 # ==================== 请求/响应模型 ====================
 
 class QueryRequest(BaseModel):
     """标准查询请求"""
     question: str
-    history: List[Dict[str, str]] = None
-    stream: bool = False  # 是否使用流式输出
+    session_id: Optional[str] = None  # 前端传入，继续历史对话；不传则开启新对话
 
 
 class StreamQueryRequest(BaseModel):
     """流式查询请求"""
     question: str
-
-
-class AgentRequest(BaseModel):
-    """Agent 请求"""
-    question: str
+    session_id: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
     """标准查询响应"""
     answer: str
     sources: List[Dict[str, Any]]
+    citations: List[Dict[str, Any]]
     search_type: str
     confidence: float
-    langchain_used: bool = False
-    chain_type: str = None
-
-
-class AgentResponse(BaseModel):
-    """Agent 响应"""
-    answer: str
-
-
-class MetricsResponse(BaseModel):
-    """监控指标响应"""
-    performance: Dict[str, Any]
-    token_usage: Dict[str, Any]
+    session_id: str
+    error_code: Optional[str] = None
+    latency_ms: float
 
 
 class HealthResponse(BaseModel):
@@ -130,31 +121,28 @@ class HealthResponse(BaseModel):
 @app.post("/api/query", response_model=QueryResponse)
 async def query_faq(request: QueryRequest):
     """
-    处理用户查询（标准模式）
-    
+    处理用户查询（异步标准模式，带 session 隔离）
+
     Args:
-        request: 包含问题和对话历史的请求
-        
+        request: 包含问题和可选 session_id 的请求
+
     Returns:
-        包含回答、来源、检索类型和置信度的响应
+        包含回答、来源、检索类型、session_id 的响应
     """
     try:
-        logger.info(f"收到查询: {request.question[:50]}...")
-        
-        # 如果请求流式输出，但客户端不支持，降级为标准输出
-        if request.stream and not use_langchain:
-            logger.warning("流式输出需要 LangChain 支持，降级为标准输出")
-        
-        result = chat_engine.chat(
-            query=request.question,
-            history=request.history
-        )
-        
-        logger.info(f"查询完成，置信度: {result['confidence']:.2f}, 检索类型: {result.get('search_type', 'unknown')}")
+        logger.info("收到查询 | session=%s | question=%s...",
+                    request.session_id or "(new)", request.question[:50])
+
+        engine = _get_chat_engine(session_id=request.session_id)
+        result = await engine.achat(query=request.question)
+
+        logger.info("查询完成 | session=%s | type=%s | confidence=%.2f | latency=%.1fms",
+                    result["session_id"], result.get("search_type", "unknown"),
+                    result["confidence"], result["latency_ms"])
         return QueryResponse(**result)
-        
+
     except Exception as e:
-        logger.error(f"查询错误: {str(e)}", exc_info=True)
+        logger.error("查询错误: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -162,33 +150,29 @@ async def query_faq(request: QueryRequest):
 async def query_stream(request: StreamQueryRequest):
     """
     流式查询（SSE 输出）
-    
+
     Args:
-        request: 包含问题的请求
-        
+        request: 包含问题和可选 session_id 的请求
+
     Returns:
         Server-Sent Events 流
     """
-    if not use_langchain:
-        raise HTTPException(
-            status_code=400, 
-            detail="流式输出需要 LangChain 支持，请设置 USE_LANGCHAIN=true"
-        )
-    
     try:
-        logger.info(f"收到流式查询: {request.question[:50]}...")
-        
+        logger.info("收到流式查询 | session=%s | question=%s...",
+                    request.session_id or "(new)", request.question[:50])
+
+        engine = _get_chat_engine(session_id=request.session_id)
+
         async def generate():
             """生成 SSE 流"""
             try:
-                async for chunk in chat_engine.astream(request.question):
-                    # SSE 格式
+                async for chunk in engine.astream(request.question):
                     yield f"data: {chunk}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                logger.error(f"流式生成错误: {e}")
+                logger.error("流式生成错误: %s", e)
                 yield f"data: [ERROR] {str(e)}\n\n"
-        
+
         return StreamingResponse(
             generate(),
             media_type="text/event-stream",
@@ -197,156 +181,43 @@ async def query_stream(request: StreamQueryRequest):
                 "Connection": "keep-alive",
             }
         )
-        
+
     except Exception as e:
-        logger.error(f"流式查询错误: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/agent", response_model=AgentResponse)
-async def query_agent(request: AgentRequest):
-    """
-    处理需要工具调用的复杂查询
-    
-    Args:
-        request: 包含问题的请求
-        
-    Returns:
-        包含回答的响应
-    """
-    if not use_langchain:
-        raise HTTPException(
-            status_code=400, 
-            detail="Agent 功能需要 LangChain 支持"
-        )
-    
-    if agent is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Agent 未初始化，请检查配置"
-        )
-    
-    try:
-        logger.info(f"收到 Agent 查询: {request.question[:50]}...")
-        result = agent.run(request.question)
-        logger.info("Agent 查询完成")
-        return AgentResponse(answer=result)
-        
-    except Exception as e:
-        logger.error(f"Agent 查询错误: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/metrics", response_model=MetricsResponse)
-async def get_metrics():
-    """
-    获取系统监控指标
-    
-    Returns:
-        性能指标和 Token 使用统计
-    """
-    try:
-        if not use_langchain:
-            return MetricsResponse(
-                performance={"note": "LangChain 未启用"},
-                token_usage={"note": "LangChain 未启用"}
-            )
-        
-        metrics = chat_engine.get_metrics()
-        return MetricsResponse(**metrics)
-        
-    except Exception as e:
-        logger.error(f"获取指标错误: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/metrics/reset")
-async def reset_metrics():
-    """
-    重置监控指标
-    
-    Returns:
-        重置结果
-    """
-    try:
-        if use_langchain:
-            chat_engine.reset_metrics()
-        return {"status": "success", "message": "指标已重置"}
-        
-    except Exception as e:
-        logger.error(f"重置指标错误: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/memory/clear")
-async def clear_memory():
-    """
-    清除对话记忆
-    
-    Returns:
-        清除结果
-    """
-    try:
-        chat_engine.clear_memory()
-        logger.info("对话记忆已清除")
-        return {"status": "success", "message": "对话记忆已清除"}
-        
-    except Exception as e:
-        logger.error(f"清除记忆错误: {e}")
+        logger.error("流式查询错误: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/health", response_model=HealthResponse)
 async def health_check():
-    """
-    健康检查接口
-    """
+    """健康检查接口"""
     features = [
-        "FAQ检索",
-        "文档检索(RAG)",
-        "混合检索",
-        "本地/API LLM支持"
+        "FAQ 检索",
+        "文档检索 (RAG)",
+        "BM25 + 向量混合检索",
+        "RRF 融合排序",
+        "Query Rewriting (指代消解)",
+        "本地/API LLM 支持",
+        "流式输出",
+        "引用溯源",
     ]
-    
-    if use_langchain:
-        features.extend([
-            "LangChain 集成",
-            "对话记忆",
-            "Agent 功能",
-            "工具调用",
-            "流式输出",
-            "监控指标"
-        ])
-    
-    if use_advanced_retriever:
-        features.extend([
-            "Multi-Query 检索",
-            "BCE-Reranker 重排序",
-            "向量库持久化"
-        ])
-    
+
     return HealthResponse(
         status="healthy",
         service="Historical FAQ Bot API",
-        version="2.0.0",
+        version="2.1.0",
         features=features
     )
 
 
 @app.get("/api/info")
 async def get_info():
-    """
-    获取服务信息
-    """
+    """获取服务信息"""
     return {
         "name": "Historical FAQ Bot",
-        "version": "2.0.0",
-        "description": "基于RAG架构的历史人物问答系统（支持LangChain集成）",
+        "version": "2.1.0",
+        "description": "基于 RAG 架构的历史人物问答系统",
         "config": {
-            "use_langchain": use_langchain,
-            "use_advanced_retriever": use_advanced_retriever,
             "llm_mode": os.getenv("LLM_MODE", "local"),
-            "chain_type": os.getenv("LANGCHAIN_CHAIN_TYPE", "rag")
         }
     }
 
@@ -355,14 +226,13 @@ async def get_info():
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # 从环境变量读取启动配置
+
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
     reload = os.getenv("API_RELOAD", "false").lower() == "true"
-    
-    logger.info(f"启动服务: {host}:{port}, reload={reload}")
-    
+
+    logger.info("启动服务: %s:%d, reload=%s", host, port, reload)
+
     uvicorn.run(
         "src.api.main:app",
         host=host,

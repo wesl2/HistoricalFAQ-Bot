@@ -76,7 +76,7 @@ BM25_CONFIG = {
 
 
 LLM_CONFIG = {
-    "default_mode": os.getenv("LLM_MODE", "local"),
+    "default_mode": os.getenv("LLM_MODE", "api"),
 
     # -------------------------------------------------------------------------
     # 本地模型配置（vLLM 服务）

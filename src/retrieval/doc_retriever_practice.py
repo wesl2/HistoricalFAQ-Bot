@@ -32,10 +32,14 @@ from src.vectorstore.pg_pool_practice import get_connection
 from config.pg_config_practice import PG_DOC_TABLE
 from rank_bm25 import BM25Okapi
 from src.retrieval.bm25_retriever_practice import BM25Retriever
+from src.retrieval.multi_query import (
+    MULTI_QUERY_ENABLED,
+    MULTI_QUERY_COUNT,
+    expand_query,
+    expand_query_sync,
+)
 
 
-
-# TODO: 创建日志记录器
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -88,9 +92,11 @@ class DocRetriever:
         top_k: int = 10,
         use_bm25: bool = True,
         bm25_weight: float = 0.3,
-        fusion_method: str = "rrf",  # 【新增】融合方法：rrf 或 linear
-        rrf_k: int = 60,  # 【新增】RRF 参数 K
+        fusion_method: str = "rrf",
+        rrf_k: int = 60,
         embedding_fn=None,
+        enable_multi_query: bool = None,
+        multi_query_count: int = None,
     ):
         """
         初始化文档检索器
@@ -102,6 +108,8 @@ class DocRetriever:
             fusion_method: 融合方法 - "rrf"（推荐）或 "linear"
             rrf_k: RRF 参数 K（通常 60，仅 rrf 模式使用）
             embedding_fn: 向量化函数（依赖注入，默认使用模块级 get_embedding）
+            enable_multi_query: 是否启用 Multi-Query 扩展（None=读环境变量）
+            multi_query_count: Multi-Query 扩展数量（None=读环境变量）
         """
         self.top_k = top_k
         self.use_bm25 = use_bm25
@@ -111,9 +119,16 @@ class DocRetriever:
         self.doc_table = PG_DOC_TABLE
         self._bm25_retriever = None
         self.embedding_fn = embedding_fn or get_embedding
+        self.enable_multi_query = (
+            enable_multi_query if enable_multi_query is not None else MULTI_QUERY_ENABLED
+        )
+        self.multi_query_count = multi_query_count or MULTI_QUERY_COUNT
         if self.use_bm25:
-            logger.info(f"Initialized DocRetriever with BM25 hybrid retrieval. "
-                        f"BM25 weight: {self.bm25_weight}, Fusion method: {self.fusion_method}, RRF K: {self.rrf_k}")
+            logger.info(
+                f"Initialized DocRetriever | BM25 hybrid | "
+                f"fusion={self.fusion_method} | multi_query={self.enable_multi_query} | "
+                f"mq_count={self.multi_query_count}"
+            )
         else:
             logger.info("Initialized DocRetriever with pure vector retrieval.")
 
@@ -135,20 +150,53 @@ class DocRetriever:
         """
         检索文档片段（根据配置自动选择检索方式）
 
+        如果启用了 Multi-Query，会先将 query 扩展为多个变体，
+        对每个变体执行检索后合并去重。
+
         Args:
             query: 用户问题
 
         Returns:
             文档检索结果列表
         """
-        # TODO: 根据配置选择检索方式
-        # 提示：
-        # - 如果 self.use_bm25 为 True，调用 retrieve_hybrid
-        # - 否则调用 retrieve_vector
-        if self.use_bm25:
-            return self.retrieve_hybrid(query)
-        else:
-            return self.retrieve_vector(query)
+        if not self.enable_multi_query:
+            # 标准单 query 检索
+            if self.use_bm25:
+                return self.retrieve_hybrid(query)
+            else:
+                return self.retrieve_vector(query)
+
+        # Multi-Query 检索
+        queries = expand_query_sync(query, self.multi_query_count)
+        logger.info(f"[MultiQuery] 开始多路检索 | {len(queries)} 个变体")
+
+        all_results: Dict[int, DocResult] = {}
+        for q in queries:
+            if self.use_bm25:
+                results = self.retrieve_hybrid(q)
+            else:
+                results = self.retrieve_vector(q)
+            for r in results:
+                # 按 id 去重，保留分数最高的
+                if r.id not in all_results or (r.similarity or 0) > (all_results[r.id].similarity or 0):
+                    all_results[r.id] = r
+
+        # 按分数排序
+        sorted_results = sorted(all_results.values(), key=lambda x: x.similarity or 0, reverse=True)
+        
+        # 修复：按 parent_text 去重，避免同一个 parent 出现多次
+        seen_parents = set()
+        final = []
+        for r in sorted_results:
+            if r.content in seen_parents:
+                continue
+            seen_parents.add(r.content)
+            final.append(r)
+            if len(final) >= self.top_k:
+                break
+        
+        logger.info(f"[MultiQuery] 多路检索完成 | 原始 query='{query}' | 合并去重后 {len(final)} 个片段")
+        return final
 
     def retrieve_vector(self, query: str) -> List[DocResult]:
         """
@@ -177,29 +225,32 @@ class DocRetriever:
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 sql = f"""
-                SELECT id,chunk_text,doc_name,doc_page,chunk_index,
+                SELECT id, chunk_text, parent_text, doc_name, doc_page, chunk_index,
                 1 - (chunk_vector <=> %s::vector) AS similarity
                 FROM {self.doc_table}
                 ORDER BY similarity DESC
-                LIMIT %s      
+                LIMIT %s
                 """
-                cursor.execute(sql,(query_str,self.top_k))
+                cursor.execute(sql, (query_str, self.top_k * 4))
                 results = cursor.fetchall()
                 doc_results = []
                 for row in results:
+                    # PDR：优先返回 parent_text，fallback 到 chunk_text（兼容旧数据）
+                    parent_text = row[2] if row[2] else row[1]
                     doc_result = DocResult(
                         id=row[0],
-                        content=row[1],
-                        doc_name=row[2],
-                        doc_page=row[3],
-                        chunk_index=row[4],
-                        similarity=row[5],
+                        content=parent_text,
+                        doc_name=row[3],
+                        doc_page=row[4],
+                        chunk_index=row[5],
+                        similarity=row[6],
                         category="vector"
                     )
                     doc_results.append(doc_result)
-                
-                logger.info(f"向量检索完成：找到 {len(results)} 个片段")
-                    
+                    if len(doc_results) >= self.top_k * 2:
+                        break
+
+                logger.info(f"向量检索完成：找到 {len(doc_results)} 个片段")
                 return doc_results    
 
 
@@ -367,40 +418,50 @@ class DocRetriever:
         k = self.rrf_k
         merged_scores = {}
 
+        # 修复：不存在的文档给惩罚性排名，而不是"最后一名+1"
+        # 否则当某一路检索结果很少时，另一路的权重会被放大
+        default_vector_rank = max(len(vector_results), self.top_k * 2)
+        default_bm25_rank = max(len(bm25_results), self.top_k * 2)
+        
         for doc_id in all_doc_ids:
-            vector_rank = vector_ranks.get(doc_id,len(vector_results) + 1)
-            bm25_rank = bm25_ranks.get(doc_id,len(bm25_results) + 1)
+            vector_rank = vector_ranks.get(doc_id, default_vector_rank)
+            bm25_rank = bm25_ranks.get(doc_id, default_bm25_rank)
             rrf_score = 1/(k + vector_rank) + 1/(k + bm25_rank)
             merged_scores[doc_id] = rrf_score
         
         score_items = list(merged_scores.items())
-        score_items.sort(key=lambda item: item[1], reverse=True) #传入 item 返回item[1]
-        #score_items是从大到小的
-        topk_doc_ids = [doc_id for doc_id,rrf_score in score_items[:self.top_k]]
+        score_items.sort(key=lambda item: item[1], reverse=True)
 
         vector_dict = {result.id: result for result in vector_results}
         bm25_dict = {result.id: result for result in bm25_results}
         final_results = []
-        for doc_id in topk_doc_ids:
+        seen_parents = set()
+        for doc_id, rrf_score in score_items:
             if doc_id in vector_dict:
                 base_result = vector_dict[doc_id]
             else:
                 base_result = bm25_dict[doc_id]
+            # PDR 去重：同一个 parent_text 只保留一次
+            if base_result.content in seen_parents:
+                continue
+            seen_parents.add(base_result.content)
             final_result = DocResult(
                 id=base_result.id,
                 content=base_result.content,
                 doc_name=base_result.doc_name,
                 doc_page=base_result.doc_page,
                 chunk_index=base_result.chunk_index,
-                similarity=merged_scores[doc_id],
+                similarity=rrf_score,
                 category="hybrid_rrf",
-                rrf_score=merged_scores[doc_id],
+                rrf_score=rrf_score,
                 vector_rank=vector_ranks.get(doc_id, len(vector_results) + 1),
                 bm25_rank=bm25_ranks.get(doc_id, len(bm25_results) + 1)
             )
             final_results.append(final_result)
+            if len(final_results) >= self.top_k:
+                break
 
-        logger.info(f"RRF 检索完成：返回 {len(final_results)} 个片段")
+        logger.info(f"RRF 检索完成：返回 {len(final_results)} 个片段（去重后）")
         return final_results
     def refresh_bm25_index(self):
         """

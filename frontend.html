@@ -334,7 +334,7 @@
                                     ${source.confidence ? `<span class="text-sm text-gray-500">置信度: ${source.confidence.toFixed(4)}</span>` : ''}
                                 </div>
                                 ${source.question ? `<p class="text-gray-700 mt-1">${source.question}</p>` : ''}
-                                ${source.source ? `<p class="text-gray-600 text-sm mt-1">来源: ${source.source}${source.page ? ` (第${source.page}页)` : ''}</p>` : ''}
+                                ${source.source ? `<p class="text-gray-600 text-sm mt-1">来源: ${source.source}</p>` : ''}
                             </div>
                         `).join('') 
                         : '<p class="text-gray-500">无参考来源</p>'

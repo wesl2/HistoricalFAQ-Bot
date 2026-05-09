@@ -1,4 +1,4 @@
-INSERT INTO faq_knowledge (question, similar_question, answer, category, source_doc)
+INSERT INTO faq_knowledge (question, answer, category, source_doc)
 VALUES
 -- 1
 (

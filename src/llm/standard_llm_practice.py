@@ -619,7 +619,9 @@ class StandardLLM:
                 cfg["base_url"] = provider_defaults.get("base_url","")  
                 cfg["model"] = cfg.get("model") or provider_defaults.get("model", "unknown")
             return cfg
-
+        
+        
+        #TODO:测试时看看怎么传环境变量最方便
         local_cfg = LLM_CONFIG["local"]
         return {
             "model": os.getenv("LOCAL_LLM_MODEL_NAME", "local-model"),

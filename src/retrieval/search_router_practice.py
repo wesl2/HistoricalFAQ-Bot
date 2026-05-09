@@ -133,6 +133,7 @@ class SearchRouter:
         faq_retriever: FAQRetriever,
         doc_retriever: DocRetriever,
         high_threshold: float = 0.82,
+        low_threshold: float = 0.62,
         executor: Optional[ThreadPoolExecutor] = None,
     ):
         """
@@ -143,12 +144,15 @@ class SearchRouter:
             doc_retriever: 文档检索器实例
             high_threshold: 高置信度阈值。FAQ 最高相似度 ≥ 此值时，
                            认为 FAQ 足以回答，直接返回 FAQ 结果。
+            low_threshold: 低置信度阈值。FAQ 最高相似度 < 此值时，
+                          认为 FAQ 不足以回答，需要文档补充。
             executor: 外部线程池（可选）。生产环境建议传入全局线程池，
                       避免每次检索都新建线程池。
         """
         self.faq_retriever = faq_retriever 
         self.doc_retriever = doc_retriever
         self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
         self._executor = executor or ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="search_router"
         )
@@ -170,6 +174,7 @@ class SearchRouter:
         latency_ms: float,
     ) -> SearchContext:
         """根据 FAQ + Doc 结果构建路由决策后的 SearchContext"""
+
         # 分支 A：FAQ 无结果 → 直接走文档检索兜底
         if not faq_results:
             doc_conf = doc_results[0].similarity if doc_results else 0.0
@@ -191,6 +196,23 @@ class SearchRouter:
         faq_results_sorted = sorted(faq_results, key=lambda x: x.similarity, reverse=True)
         max_similarity = faq_results_sorted[0].similarity
 
+        # 分支 B：FAQ 分数太低 → 直接走文档检索兜底
+        if max_similarity < self.low_threshold:
+            doc_conf = doc_results[0].similarity if doc_results else 0.0
+            logger.info(
+                "FAQ 最高分低于最低阈值，路由至 DOC_ONLY, "
+                "文档最高相似度: %.3f，耗时: %.1fms",
+                doc_conf, latency_ms,
+            )
+            return SearchContext(
+                faq_results=[],
+                doc_results=doc_results,
+                search_type=SearchType.DOC_ONLY,
+                confidence=doc_conf,
+                routing_reason="FAQ 最高分低于最低阈值，fallback 至文档检索",
+                latency_ms=latency_ms,
+            )
+        
         # 分支 B：高置信度 → 直接返回 FAQ 答案
         if max_similarity >= self.high_threshold:
             return SearchContext(
@@ -306,7 +328,7 @@ def test_search_router(query: str):
     注意：测试前确保数据库里已经有 FAQ 和文档数据。
     """
     
-    faq_retriever = FAQRetriever(top_k=3)
+    faq_retriever = FAQRetriever(top_k=5)
     doc_retriever = DocRetriever(top_k=10, use_bm25=True, fusion_method="rrf", rrf_k=60)
     router = SearchRouter(faq_retriever=faq_retriever, doc_retriever=doc_retriever)
     result = router.search(query)
@@ -320,7 +342,7 @@ def test_search_router(query: str):
 
 
 if __name__ == "__main__":
-    test_search_router("王洪文和张春桥好厉害哦")
+    test_search_router("李世民好厉害哦")
 
 # =============================================================================
 # 第七部分：思考题（完成代码后回答）

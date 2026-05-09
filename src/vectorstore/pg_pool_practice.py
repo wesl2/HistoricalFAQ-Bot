@@ -23,6 +23,9 @@ PostgreSQL 连接池管理模块 - 练习版本
 # - PG_URL, POOL_MIN_CONN, POOL_MAX_CONN from config.pg_config: 配置
 
 # 你的代码：
+from collections.abc import Generator  # 或 from typing import Generator
+import psycopg2
+from psycopg2.extensions import cursor
 from pathlib import Path
 import logging,sys,os
 project_root = Path(__file__).parent.parent.parent  # 根据文件层级调整
@@ -189,7 +192,7 @@ def get_connection(cursor_factory=None):
 # - 调用者只需要处理 cursor，connection 自动管理
 
 @contextmanager
-def get_cursor(cursor_factory: type[psycopg2.extensions.cursor] | None = None)-> Iterator[psycopg2.extensions.cursor]:
+def get_cursor(cursor_factory: type[psycopg2.extensions.cursor] | None = None)-> Generator[psycopg2.extensions.cursor, None, None]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=cursor_factory) as cursor:
             yield cursor

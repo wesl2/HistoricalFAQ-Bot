@@ -34,6 +34,7 @@ BM25（Best Matching 25）是一种基于概率的全文检索算法，
 
 # TODO: 创建日志记录器
 import logging
+import threading
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from rank_bm25 import BM25Okapi
@@ -43,6 +44,15 @@ from config.pg_config_practice import PG_DOC_TABLE
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# BM25 全局索引缓存（进程级单例）
+# =============================================================================
+# 设计：BM25 索引只加载一次，所有 DocRetriever 实例共享。
+# 缓存 key 为 table_name（索引本身和 top_k 无关，top_k 只是截断结果），
+# value 为 BM25Retriever 实例。当数据库文档更新时，调用 refresh_index() 会更新缓存。
+_BM25_INDEX_CACHE: Dict[str, "BM25Retriever"] = {}
+_BM25_CACHE_LOCK = threading.Lock()  # 真锁，防止并发初始化时重复建索引
 
 @dataclass
 class BM25Result:
@@ -64,27 +74,56 @@ class BM25Retriever:
     1. 适合关键词查询（人名、地名、专有名词）
     2. 可与向量检索互补（混合检索）
     3. 独立于数据库，纯 Python 实现
+    4. 支持自动检测数据变化并热更新索引
     """
     
-    def __init__(self, top_k: int = 10):
+    def __init__(self, top_k: int = 10, _skip_cache: bool = False):
         """
         初始化 BM25 检索器
         
         Args:
             top_k: 返回结果数量
+            _skip_cache: 内部标志，用于 refresh_index 时绕过缓存
         """
-        # TODO: 初始化实例属性
-        # 提示：
-        # 1. 保存 top_k
-        # 2. 初始化 bm25 为 None
-        # 3. 初始化 documents 为空列表
-        # 4. 初始化 tokenized_docs 为空列表
-        # 5. 调用 _load_documents() 加载文档
         self.top_k = top_k
         self.bm25: BM25Okapi = None
         self.documents = []
         self.tokenized_docs = []
-        self._load_documents()
+        
+        # 自动刷新相关状态
+        self._last_doc_count = 0
+        self._last_refresh_time = 0
+        self._auto_refresh_interval = 60  # 每 60 秒检查一次数据变化
+        
+        # 缓存 key 只用表名，和 top_k 无关（索引本身和 top_k 无关，top_k 只是截断结果）
+        cache_key = PG_DOC_TABLE
+        
+        if not _skip_cache and cache_key in _BM25_INDEX_CACHE:
+            cached = _BM25_INDEX_CACHE[cache_key]
+            self.bm25 = cached.bm25
+            self.documents = cached.documents
+            self.tokenized_docs = cached.tokenized_docs
+            self._last_doc_count = getattr(cached, '_last_doc_count', len(self.documents))
+            self._last_refresh_time = getattr(cached, '_last_refresh_time', 0)
+            logger.info(f"BM25 索引从缓存加载 | 文档数: {len(self.documents)}")
+        else:
+            with _BM25_CACHE_LOCK:
+                # 双重检查：拿到锁后再确认一次缓存是否已被其他线程建好
+                if not _skip_cache and cache_key in _BM25_INDEX_CACHE:
+                    cached = _BM25_INDEX_CACHE[cache_key]
+                    self.bm25 = cached.bm25
+                    self.documents = cached.documents
+                    self.tokenized_docs = cached.tokenized_docs
+                    self._last_doc_count = getattr(cached, '_last_doc_count', len(self.documents))
+                    self._last_refresh_time = getattr(cached, '_last_refresh_time', 0)
+                    logger.info(f"BM25 索引从缓存加载 | 文档数: {len(self.documents)}")
+                else:
+                    self._load_documents()
+                    self._last_doc_count = len(self.documents)
+                    self._last_refresh_time = __import__('time').time()
+                    if not _skip_cache:
+                        _BM25_INDEX_CACHE[cache_key] = self
+                        logger.info(f"BM25 索引已缓存 | key={cache_key}")
 
 
     def _load_documents(self):
@@ -114,7 +153,7 @@ class BM25Retriever:
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(f"""
-                    SELECT ID, CHUNK_TEXT, DOC_NAME, DOC_PAGE,CHUNK_INDEX
+                    SELECT ID, CHUNK_TEXT, PARENT_TEXT, DOC_NAME, DOC_PAGE, CHUNK_INDEX
                     FROM {PG_DOC_TABLE}
                     ORDER BY ID
                 """)
@@ -122,10 +161,11 @@ class BM25Retriever:
                        self.documents.append(
                         {
                             "id": row[0],
-                            "content": row[1],
-                            "doc_name": row[2],
-                            "doc_page": row[3] if row[3] is not None else 0,
-                            "chunk_index": row[4] if row[4] is not None else 0
+                            "content": row[1],           # chunk_text: 用于 BM25 分词
+                            "parent_text": row[2],       # parent_text: 用于返回给 LLM
+                            "doc_name": row[3],
+                            "doc_page": row[4] if row[4] is not None else 0,
+                            "chunk_index": row[5] if row[5] is not None else 0
                         }
                        )
                 cursor.close()
@@ -151,6 +191,40 @@ class BM25Retriever:
         logger.info(f"文档加载完成，数量: {len(self.documents)}, 总词数: {sum(len(tokens) for tokens in self.tokenized_docs)}")
     
     
+    def _get_db_doc_count(self) -> int:
+        """轻量查询数据库当前记录数"""
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(f"SELECT COUNT(*) FROM {PG_DOC_TABLE}")
+                    count = cursor.fetchone()[0]
+                    return count
+        except Exception as e:
+            logger.warning("[BM25] 查询数据库记录数失败: %s", e)
+            return self._last_doc_count  # 失败时返回上次记录数，避免误刷新
+    
+    def _check_and_refresh(self):
+        """
+        自动检测数据变化并刷新索引。
+        
+        策略：每隔 _auto_refresh_interval 秒检查一次数据库记录数，
+        如果记录数变化了，自动调用 refresh_index() 重建索引。
+        """
+        import time
+        now = time.time()
+        if now - self._last_refresh_time < self._auto_refresh_interval:
+            return  # 还没到检查间隔
+        
+        current_count = self._get_db_doc_count()
+        if current_count != self._last_doc_count:
+            logger.info(
+                "[BM25] 检测到数据变化: %d → %d，自动刷新索引",
+                self._last_doc_count, current_count
+            )
+            self.refresh_index()
+        else:
+            self._last_refresh_time = now  # 更新时间戳，避免频繁查询
+    
     def retrieve(self, query: str) -> List[BM25Result]:
         """
         BM25 检索
@@ -161,17 +235,9 @@ class BM25Retriever:
         Returns:
             BM25 检索结果列表（按分数降序）
         """
-        # 实现 BM25 检索
-        # 提示：
-        # 1. 检查 bm25 索引是否已加载，如果未加载记录错误并返回空列表
-        # 2. 使用 jieba.cut() 对查询进行分词，转换为列表
-        # 3. 调用 bm25.get_scores() 获取所有文档的 BM25 分数
-        # 4. 使用 numpy.argsort() 获取排序索引，取 Top-K（降序）
-        # 5. 遍历 Top-K 索引：
-        #    - 过滤掉分数低于 0.1 的结果（可选阈值）
-        #    - 根据索引从 documents 获取文档信息
-        #    - 创建 BM25Result 对象
-        # 6. 记录日志并返回结果列表
+        # 自动检测数据变化（热更新）
+        self._check_and_refresh()
+        
         if not self.bm25:
             logger.error("BM25 索引未加载")
             return []
@@ -182,21 +248,29 @@ class BM25Retriever:
         # 取 Top-K
         # 使用 argsort 获取排序索引
         # 通过 BM25 获取的是分数  ， np.argsort(scores) 返回的才是索引
-        top_indices = np.argsort(scores)[-self.top_k:][::-1]
+        top_indices = np.argsort(scores)[-self.top_k * 2:][::-1]
         results = []
+        seen_parents = set()
         for idx in top_indices:
             if scores[idx] < 0.1:
                 continue
             doc = self.documents[idx]
+            # PDR：优先返回 parent_text，fallback 到 chunk_text（兼容旧数据）
+            parent_text = doc.get("parent_text") or doc["content"]
+            if parent_text in seen_parents:
+                continue
+            seen_parents.add(parent_text)
             result = BM25Result(
                 id=doc["id"],
-                content=doc["content"],
+                content=parent_text,
                 doc_name=doc["doc_name"],
                 doc_page=doc["doc_page"],
                 chunk_index=doc["chunk_index"],
                 score=scores[idx]
-                )
+            )
             results.append(result)
+            if len(results) >= self.top_k:
+                break
         logger.info(f"BM25 检索完成：找到 {len(results)} 个片段（查询：{query}）")
         return results
     
@@ -253,16 +327,19 @@ class BM25Retriever:
         """
         刷新 BM25 索引（当数据库文档更新时调用）
         """
-        # TODO: 实现索引刷新
-        # 提示：
-        # 1. 记录日志：刷新 BM25 索引
-        # 2. 重置 documents, tokenized_docs, bm25
-        # 3. 重新调用 _load_documents()
         logger.info("刷新 BM25 索引...")
+        cache_key = PG_DOC_TABLE
+        with _BM25_CACHE_LOCK:
+            if cache_key in _BM25_INDEX_CACHE:
+                del _BM25_INDEX_CACHE[cache_key]
+                logger.info(f"BM25 缓存已清除 | key={cache_key}")
         self.documents = []
         self.tokenized_docs = []
         self.bm25 = None
         self._load_documents()
+        with _BM25_CACHE_LOCK:
+            _BM25_INDEX_CACHE[cache_key] = self
+        logger.info(f"BM25 索引已重新缓存 | key={cache_key}")
 
 # =============================================================================
 # 测试代码

@@ -39,30 +39,20 @@ def create_tables(drop_existing: bool = False):
                     question TEXT NOT NULL,
                     question_vector vector({VECTOR_DIM}),
                     answer TEXT NOT NULL,
-                    search_vector tsvector 
-                        GENERATED ALWAYS AS (to_tsvector('simple', question)) STORED,
                     category VARCHAR(50),
                     source_doc VARCHAR(200),
-                    source_page INTEGER,
-                    confidence FLOAT DEFAULT 0.9,
                     created_by VARCHAR(50) DEFAULT 'auto',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             
-            # 创建索引
+            # 创建 HNSW 向量索引
             cursor.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_hnsw_faq 
                 ON {PG_TABLE_NAME} 
                 USING hnsw (question_vector vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64);
-            """)
-            
-            cursor.execute(f"""
-                CREATE INDEX IF NOT EXISTS idx_gin_faq
-                ON {PG_TABLE_NAME}
-                USING gin (search_vector);
             """)
             
             # 创建文档片段表
@@ -71,12 +61,11 @@ def create_tables(drop_existing: bool = False):
                 CREATE TABLE IF NOT EXISTS {PG_DOC_TABLE} (
                     id SERIAL PRIMARY KEY,
                     chunk_text TEXT NOT NULL,
+                    parent_text TEXT,
                     chunk_vector vector({VECTOR_DIM}),
                     doc_name VARCHAR(200) NOT NULL,
                     doc_page INTEGER,
                     chunk_index INTEGER,
-                    search_vector tsvector 
-                        GENERATED ALWAYS AS (to_tsvector('simple', chunk_text)) STORED,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -118,5 +107,5 @@ def create_tables(drop_existing: bool = False):
 
 
 def init_database():
-    """初始化数据库（创建所有表）"""
-    create_tables(drop_existing=False)
+    """初始化数据库（删除旧表并重建）"""
+    create_tables(drop_existing=True)

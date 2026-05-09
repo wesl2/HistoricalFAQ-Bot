@@ -105,6 +105,8 @@ except ImportError:
 
 # DocumentProcessor 是项目内置的文档处理器，封装了 LangChain 的加载器和分块器
 from src.data_pipeline.document_processor import DocumentProcessor
+from src.data_pipeline.pdr_markdown_splitter import PdrMarkdownSplitter, PdrChunk
+from langchain_core.documents import Document
 
 # 配置导入：PG_DOC_TABLE 是文档片段表名，EMBEDDING_CONFIG 包含模型参数
 from config.pg_config import PG_DOC_TABLE
@@ -336,9 +338,10 @@ class TextCleaner:
         text = re.sub(r"={5,}", "", text)
 
         # --- 混入正文的章节标题+页码 ---
-        # 匹配模式如：第十四章武装叛乱的失获485
+        # 匹配模式如：第十四章武装叛乱的失获485（标题和页码粘连，无空格/标点）
         # [一二三四五六七八九十百]+ 匹配中文数字序列
-        text = re.sub(r"第[一二三四五六七八九十百]+章.*?\d+", "", text)
+        # 注意：要求数字前无空格/标点，避免误杀 markdown heading（如"# 第二章 隋朝，581—617年"）
+        text = re.sub(r"第[一二三四五六七八九十百]+章[^\s\d,，.。;；:：\-\—]{2,}\d+", "", text)
 
         # --- 奇怪章节头（特定项目历史残留）---
         text = re.sub(r"总序站\)", "", text)
@@ -370,31 +373,44 @@ class TextCleaner:
         return text
 
     @classmethod
-    def normalize(cls, text: str) -> str:
+    def normalize(cls, text: str, is_markdown: bool = False) -> str:
         """
         格式化：统一换行、去除首尾空格、删除空行。
 
+        Args:
+            text: 输入文本
+            is_markdown: 是否是 Markdown 格式。
+                         True 时保留双换行（段落分隔），False 时压缩为单换行。
+
         2026-04-17 修复：删除了 bug 行 `text.replace(r"\n", "\n")`。
-        原代码的问题：r"\n" 在 Python 中表示"反斜杠 + n"两个字符的字面量，
-        它不会匹配真实的换行符（\n 的 ASCII 码是 0x0A），因此这一行没有任何实际作用。
-        如果目的是替换文本里出现的字面量 `\n`（两个字符），应该写成 `.replace("\\n", "\n")`。
-        但当前数据里没有这种需求，所以直接删除该行。
+        2026-05-07 修改：支持 Markdown 格式，保留段落结构。
         """
-        # 多个连续换行压缩为单个，避免段落之间出现大量空行
-        text = re.sub(r"\n+", "\n", text)
+        if is_markdown:
+            # Markdown 需要保留双换行作为段落分隔
+            # 3个以上连续换行 → 2个（保留段落空行）
+            text = re.sub(r"\n{3,}", "\n\n", text)
+        else:
+            # 纯文本：多个连续换行压缩为单个
+            text = re.sub(r"\n+", "\n", text)
         # 去掉字符串首尾的空格和换行
         text = text.strip()
         return text
 
     @classmethod
-    def clean(cls, text: str) -> str:
+    def clean(cls, text: str, is_markdown: bool = False) -> str:
         """
         完整清洗流程：OCR 重组 -> 去噪 -> 格式化。
         这是 TextCleaner 的对外统一入口，调用方只需要调用这一个方法。
+
+        Args:
+            text: 输入文本
+            is_markdown: 是否是 Markdown 格式。
+                         Markdown 格式跳过 OCR 重组（EPUB 等电子书无需 OCR 修复）。
         """
-        text = cls.wash_ocr(text)   # 第一步：修复 OCR 断行和字间空格
-        text = cls.denoise(text)    # 第二步：切除页眉页脚、水印等版式噪声
-        text = cls.normalize(text)  # 第三步：统一空白、压缩换行
+        if not is_markdown:
+            text = cls.wash_ocr(text)   # 第一步：修复 OCR 断行和字间空格
+        text = cls.denoise(text)        # 第二步：切除页眉页脚、水印等版式噪声
+        text = cls.normalize(text, is_markdown=is_markdown)  # 第三步：统一空白
         return text
 
 
@@ -409,11 +425,11 @@ def load_and_clean_documents(file_path: str) -> List:
     返回 LangChain Document 对象列表（带 metadata）。
 
     为什么不直接 open() 读 txt？
-      因为 DocumentProcessor 封装了多格式支持（PDF、TXT、DOCX），
+      因为 DocumentProcessor 封装了多格式支持（PDF、TXT、DOCX、EPUB），
       并且会自动提取 metadata（如 PDF 的页码）。
     """
     processor = DocumentProcessor()
-    # load_document 内部会根据后缀名选择对应的 Loader（PyPDFLoader / TextLoader / DocxLoader）
+    # load_document 内部会根据后缀名选择对应的 Loader
     raw_docs = processor.load_document(file_path)
     if not raw_docs:
         return []  # 加载失败或文件为空
@@ -421,22 +437,30 @@ def load_and_clean_documents(file_path: str) -> List:
     # Path(file_path).stem 提取文件名（不带后缀），作为 doc_name
     # 例如 "/data/raw/唐史.txt" -> "唐史"
     doc_name = Path(file_path).stem
+    file_ext = Path(file_path).suffix.lower()
+    
+    # EPUB 解析后已经是 Markdown 格式，跳过 OCR 重组，保留段落结构
+    is_markdown = (file_ext == '.epub')
+    
     cleaned_docs = []
 
     for i, doc in enumerate(raw_docs):
         # 对每一页/每一段调用完整清洗流程
-        cleaned_text = TextCleaner.clean(doc.page_content)
+        cleaned_text = TextCleaner.clean(doc.page_content, is_markdown=is_markdown)
         if not cleaned_text:
             continue  # 清洗后为空，跳过
 
         # --- 页码处理 ---
         # PyPDFLoader 会在 metadata 里放 "page" 字段，值是 0 起始的页码。
-        # 为了和人类阅读习惯一致，转成 1 起始。
-        page_num = doc.metadata.get("page", 0)
-        if isinstance(page_num, int):
-            page_num += 1
+        # EPUB 没有固定页码，使用 chapter_count 或 0
+        if file_ext == '.epub':
+            page_num = doc.metadata.get("chapter_count", 0)
         else:
-            page_num = 1
+            page_num = doc.metadata.get("page", 0)
+            if isinstance(page_num, int):
+                page_num += 1
+            else:
+                page_num = 1
 
         # 把清洗后的文本写回 Document 对象
         doc.page_content = cleaned_text
@@ -454,42 +478,69 @@ def load_and_clean_documents(file_path: str) -> List:
 def semantic_chunk_documents(
     documents: List,
     chunk_size: int = 1024,
-    chunk_overlap: int = 128
+    chunk_overlap: int = 128,
+    file_ext: str = "",
 ) -> List:
     """
-    语义递归分块。
-    使用 RecursiveCharacterTextSplitter，优先在段落边界、句子边界切分，
-    而不是粗暴的固定长度截断。
+    语义分块。
 
-    为什么要用递归分块？
-      固定长度切分（如每 512 字符一刀切）很容易把一句话从中间切断，
-      导致 chunk 的前半句和后半句语义不连贯，向量检索质量下降。
-      RecursiveCharacterTextSplitter 会按优先级尝试多种分隔符：
-      段落(\n\n) -> 换行(\n) -> 句子(。！？) -> 空格 -> 字符，
-      尽量保证切分点落在语义边界上。
-
-    Args:
-        documents : LangChain Document 列表
-        chunk_size: 每个 chunk 的目标字符长度（不是 token 数，是字符数）
-        chunk_overlap: 相邻 chunk 之间的重叠字符数，防止边界信息丢失
+    策略选择：
+      - EPUB（Markdown 格式）：使用 PDR（Parent Document Retrieval）切分
+        Parent 按 Markdown 标题（# / ##）切分章节级语义单元
+        Child 在 Parent 内部用 TokenTextSplitter 切 512 token 小块
+        保留 parent_text 用于 LLM 生成，chunk_text 用于向量检索
+      
+      - PDF/TXT/DOCX：使用 RecursiveCharacterTextSplitter 单层切分
+        按优先级尝试：段落(\n\n) -> 换行(\n) -> 句子(。！？) -> 空格 -> 字符
     """
-    processor = DocumentProcessor()
-    chunks = processor.split_documents(
-        documents,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        splitter_type="recursive"
-    )
+    if file_ext == '.epub':
+        # PDR 切分（EPUB → Markdown 专用）
+        splitter = PdrMarkdownSplitter(
+            parent_headers=[("#", "H1"), ("##", "H2")],
+            child_chunk_size=512,           # 约 500 token，适合 BGE-M3
+            child_chunk_overlap=128,
+            min_parent_length=200,
+            add_contextual_header=True,      # Anthropic Contextual Retrieval
+        )
+        pdr_chunks = splitter.split_documents(documents)
+        
+        # 转换为 LangChain Document 兼容格式（保留 PDR 元数据）
+        chunks = []
+        for pc in pdr_chunks:
+            doc = Document(
+                page_content=pc.chunk_text,
+                metadata={
+                    "doc_name": pc.doc_name,
+                    "doc_page": pc.doc_page,
+                    "chunk_index": pc.chunk_index,
+                    "heading": pc.heading,
+                    "heading_level": pc.heading_level,
+                    "parent_text": pc.parent_text,
+                    "contextual_header": pc.contextual_header,
+                    "source": documents[0].metadata.get("source", "") if documents else "",
+                }
+            )
+            chunks.append(doc)
+        
+        logger.info(f"PDR 切分完成：{len(pdr_chunks)} chunks（EPUB）")
+        return chunks
+    
+    else:
+        # 传统单层切分（PDF/TXT/DOCX）
+        processor = DocumentProcessor()
+        chunks = processor.split_documents(
+            documents,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            splitter_type="recursive"
+        )
 
-    # --- 长度过滤 ---
-    # 丢弃过短的碎块（< 50 字符）。
-    # 这些碎块通常是标题、页码残留、或清洗后的边角料，
-    # 对检索和回答几乎没有任何价值，还会浪费 Embedding 计算资源。
-    filtered = [c for c in chunks if len(c.page_content.strip()) >= 50]
-    if len(filtered) < len(chunks):
-        logger.info(f"过滤短碎块：原始 {len(chunks)} -> 保留 {len(filtered)}")
+        # 长度过滤：丢弃过短的碎块
+        filtered = [c for c in chunks if len(c.page_content.strip()) >= 50]
+        if len(filtered) < len(chunks):
+            logger.info(f"过滤短碎块：原始 {len(chunks)} -> 保留 {len(filtered)}")
 
-    return filtered
+        return filtered
 
 
 # ############################################################################
@@ -502,19 +553,33 @@ def semantic_chunk_documents(
 # 头部信息也能让 BM25 命中。
 
 
-def enrich_chunk(chunk) -> str:
+def enrich_chunk(chunk) -> Tuple[str, str]:
     """
     为 chunk 添加上下文头部信息，提升检索质量。
     参考 Anthropic 2024 Contextual Retrieval。
+    
+    Returns:
+        (enriched_text_for_embedding, parent_text_for_llm)
+        enriched_text: 用于 embedding 的文本（带上下文头）
+        parent_text: 用于 LLM 生成的父级文本（PDR 时完整章节，传统切分时为空）
     """
     doc_name = chunk.metadata.get("doc_name", "未知文档")
     doc_page = chunk.metadata.get("doc_page", 0)
     content = chunk.page_content.strip()
+    
+    # PDR 模式：使用 Anthropic 式上下文头
+    contextual_header = chunk.metadata.get("contextual_header", "")
+    if contextual_header:
+        # PDR 模式：上下文头 + 来源 + child 内容
+        enriched = f"{contextual_header}\n{content}"
+        parent_text = chunk.metadata.get("parent_text", "")
+    else:
+        # 传统模式：简单来源头 + 内容
+        header = f"【来源：《{doc_name}》第{doc_page}页】"
+        enriched = f"{header}\n{content}"
+        parent_text = ""
 
-    # 构建简短的上下文头
-    header = f"【来源：《{doc_name}》第{doc_page}页】"
-    # 用换行符把头部和正文隔开，既清晰又不影响语义
-    return f"{header}\n{content}"
+    return enriched, parent_text
 
 
 # ############################################################################
@@ -599,7 +664,8 @@ def insert_chunks_to_db(
 
     Args:
         records : List[Tuple]，每个元组为
-                  (chunk_text, chunk_vector_str, doc_name, doc_page, chunk_index)
+                  (chunk_text, parent_text, chunk_vector_str, doc_name, doc_page, chunk_index)
+                  parent_text 为 PDR 父级文本，可为空字符串（传统切分模式）
         append  : True 表示增量模式（先删旧再插新），False 表示全量模式（先 TRUNCATE）
         doc_name: 增量模式下用于定位旧记录的文档名
     """
@@ -632,7 +698,7 @@ def insert_chunks_to_db(
             # 比 execute() 循环快 10-100 倍。
             insert_sql = f"""
                 INSERT INTO {PG_DOC_TABLE}
-                (chunk_text, chunk_vector, doc_name, doc_page, chunk_index)
+                (chunk_text, parent_text, chunk_vector, doc_name, doc_page, chunk_index)
                 VALUES %s
             """
             from psycopg2.extras import execute_values
@@ -686,19 +752,21 @@ def process_single_file(
         logger.warning(f"文档为空或加载失败：{file_path}")
         return 0, file_hash
 
-    # 步骤 2：语义分块
-    chunks = semantic_chunk_documents(cleaned_docs, chunk_size, chunk_overlap)
+    # 步骤 2：语义分块（根据文件类型选择策略）
+    file_ext = Path(file_path).suffix.lower()
+    chunks = semantic_chunk_documents(cleaned_docs, chunk_size, chunk_overlap, file_ext=file_ext)
     if not chunks:
         logger.warning(f"分块后无有效内容：{file_path}")
         return 0, file_hash
 
     # 步骤 3：上下文增强 & 内容去重
     enriched_texts = []
+    parent_texts = []    # PDR: 父级完整文本
     meta_infos = []
     seen_hashes = set()  # 同一文档内的 chunk 级去重
 
     for idx, chunk in enumerate(chunks):
-        enriched = enrich_chunk(chunk)
+        enriched, parent_text = enrich_chunk(chunk)
 
         # 基于内容 MD5 去重：如果两个 chunk 的文本完全一样，只保留第一个
         h = hashlib.md5(enriched.encode("utf-8")).hexdigest()
@@ -707,10 +775,12 @@ def process_single_file(
         seen_hashes.add(h)
 
         enriched_texts.append(enriched)
+        parent_texts.append(parent_text)
         meta_infos.append({
             "doc_name": chunk.metadata.get("doc_name", ""),
             "doc_page": chunk.metadata.get("doc_page", 0),
             "chunk_index": idx,
+            "heading": chunk.metadata.get("heading", ""),
         })
 
     if not enriched_texts:
@@ -727,13 +797,14 @@ def process_single_file(
 
     # 步骤 5：组装数据库记录（过滤掉 embedding 失败的 None）
     db_records = []
-    for text, vec, meta in zip(enriched_texts, vectors, meta_infos):
+    for text, vec, parent_text, meta in zip(enriched_texts, vectors, parent_texts, meta_infos):
         if vec is None:
             continue  # embedding 失败，直接丢弃，不写入数据库
         # 将浮点数列表转换成 PostgreSQL vector 类型接受的字符串格式 "[0.1,0.2,...]"
         vec_str = "[" + ",".join([str(v) for v in vec]) + "]"
         db_records.append((
-            text,
+            text,              # chunk_text: 用于向量检索
+            parent_text,       # parent_text: PDR 父级文本，用于 LLM 生成
             vec_str,
             meta["doc_name"],
             meta["doc_page"],
@@ -784,9 +855,10 @@ def main():
         files = sorted(input_path.glob("*.txt"))
         files += sorted(input_path.glob("*.pdf"))
         files += sorted(input_path.glob("*.docx"))
+        files += sorted(input_path.glob("*.epub"))
 
     if not files:
-        logger.warning("未找到任何支持的文档文件（.txt / .pdf / .docx）")
+        logger.warning("未找到任何支持的文档文件（.txt / .pdf / .docx / .epub）")
         sys.exit(0)
 
     # 仅在增量模式下加载文件级 MD5 缓存

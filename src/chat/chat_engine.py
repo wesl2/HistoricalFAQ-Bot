@@ -23,7 +23,7 @@ from src.retrieval.search_router_practice import SearchRouter
 from src.retrieval.faq_retriever_practice import FAQRetriever
 from src.retrieval.doc_retriever_practice import DocRetriever
 from src.llm.standard_llm_new import LLMError, LLMUnavailableError, StandardLLM
-from src.chat.response_generator import ResponseGenerator
+from src.chat.response_generator import ResponseGenerator, GenerationResult
 from src.vectorstore.pg_pool_practice import get_cursor
 from src.embedding.embedding_local_practice import get_embedding as _shared_get_embedding
 from config.pg_config import PG_CHAT_TABLE
@@ -107,6 +107,7 @@ class ChatEngine:
         session_id: str = None,
         history_limit: int = 10,
         llm_timeout: float = DEFAULT_LLM_TIMEOUT,
+        enable_multi_query: bool = None,
     ):
         """
         初始化对话引擎
@@ -118,8 +119,9 @@ class ChatEngine:
             session_id: 会话 ID，用于标识对话，None 则自动生成
             history_limit: 每次加载的历史消息条数（默认 10 条）
             llm_timeout: LLM 调用超时时间（秒，默认 60）
+            enable_multi_query: 是否启用 Multi-Query 扩展（None=读环境变量）
         """
-        self.search_router = search_router or self._default_search_router()
+        self.search_router = search_router or self._default_search_router(enable_multi_query)
         self.response_gen = response_gen or ResponseGenerator(llm_mode=llm_mode)
         self.llm_mode = llm_mode
         self.session_id = session_id or str(uuid.uuid4())
@@ -127,15 +129,16 @@ class ChatEngine:
         self.llm_timeout = llm_timeout
 
         logger.info(
-            "[ChatEngine] 初始化完成 | mode=%s | session=%s | history_limit=%d | llm_timeout=%.0fs",
+            "[ChatEngine] 初始化完成 | mode=%s | session=%s | mq=%s | history_limit=%d | llm_timeout=%.0fs",
             llm_mode or "default",
             self.session_id,
+            enable_multi_query,
             history_limit,
             llm_timeout,
         )
 
     @staticmethod
-    def _default_search_router() -> SearchRouter:
+    def _default_search_router(enable_multi_query: bool = None) -> SearchRouter:
         """构建默认的 SearchRouter（内部组装 FAQ + Doc 检索器）"""
         # 统一注入共享的 embedding 函数，避免重复加载模型
         faq_retriever = FAQRetriever(top_k=3, embedding_fn=_shared_get_embedding)
@@ -145,6 +148,7 @@ class ChatEngine:
             fusion_method="rrf",
             rrf_k=60,
             embedding_fn=_shared_get_embedding,
+            enable_multi_query=enable_multi_query,
         )
         return SearchRouter(
             faq_retriever=faq_retriever,
@@ -210,6 +214,7 @@ class ChatEngine:
             raise DatabaseError(f"保存历史失败: {e}") from e
         except Exception as e:
             logger.warning("[ChatEngine] 保存历史失败（非 DB 错误）: %s", e)
+            raise DatabaseError(f"保存历史失败: {e}") from e
 
     def _history_to_messages(self, history: List[Dict[str, str]]) -> List[HumanMessage | AIMessage]:
         """
@@ -352,12 +357,14 @@ class ChatEngine:
                 }]
             else:
                 try:
-                    answer = self.response_gen.generate(
+                    gen_result = self.response_gen.generate(
                         query=query,
                         faq_results=search_context.faq_results,
                         doc_results=search_context.doc_results,
                         history_messages=history_messages,
                     )
+                    answer = gen_result.answer
+                    citations = gen_result.citations
                 except (LLMError, LLMUnavailableError) as e:
                     raise GenerationError(f"LLM 生成失败: {e}") from e
 
@@ -375,9 +382,12 @@ class ChatEngine:
                             "page": r.doc_page
                         })
 
-            # 4. 保存历史
-            self._save_history("human", query)
-            self._save_history("ai", answer)
+            # 4. 保存历史（主流程中的保存不应影响回答返回）
+            try:
+                self._save_history("human", query)
+                self._save_history("ai", answer)
+            except DatabaseError as e:
+                logger.warning("[ChatEngine] chat 主流程保存历史失败: %s", e)
 
         except DatabaseError as e:
             logger.error("[ChatEngine] 数据库错误: %s", e)
@@ -420,8 +430,8 @@ class ChatEngine:
                 try:
                     self._save_history("human", query)
                     self._save_history("ai", answer)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("[ChatEngine] chat finally 保存历史失败: %s", e)
 
             logger.info(
                 "[ChatEngine] chat | session=%s | type=%s | faq_hits=%d | doc_hits=%d | "
@@ -435,14 +445,162 @@ class ChatEngine:
                 latency_ms,
             )
 
-        # 【P0: 引用溯源】解析回答中的引用标记
-        if answer:
-            citations = self.response_gen.extract_citations(answer)
+        # citations 已在 generate() 内部提取（线程安全）
+        # 如果走异常分支（answer 是兜底文案），citations 保持为空列表
+        return {
+            "answer": answer,
+            "sources": sources,
+            "citations": citations,
+            "search_type": search_type,
+            "confidence": confidence,
+            "session_id": self.session_id,
+            "error_code": error_code,
+            "latency_ms": round(latency_ms, 1),
+        }
+
+    # -----------------------------------------------------------------------
+    # 异步标准对话（achat）—— 接上 asearch 的并行检索收益
+    # -----------------------------------------------------------------------
+
+    async def achat(self, query: str) -> Dict[str, Any]:
+        """
+        异步版本 chat，内部调用 search_router.asearch()，享受并行检索收益。
+
+        Returns:
+            同 chat() 的返回结构
+        """
+        t0 = time.perf_counter()
+        error_code = None
+        answer = ""
+        sources = []
+        citations = []
+        search_type = "unknown"
+        confidence = 0.0
+        search_context = None
+
+        try:
+            # 1. 加载历史（同步 DB → 线程池）
+            history = await asyncio.to_thread(self._load_history)
+            history_messages = self._history_to_messages(history)
+
+            # 2. Query Rewriting（异步版本）
+            rewritten_query = await self._arewrite_query(query, history)
+
+            # 3. 检索 —— 这里接上 async！
+            try:
+                if hasattr(self.search_router, "asearch"):
+                    search_context = await self.search_router.asearch(rewritten_query)
+                else:
+                    search_context = await asyncio.to_thread(
+                        self.search_router.search, rewritten_query
+                    )
+                search_type = search_context.search_type.value
+                confidence = search_context.confidence
+            except Exception as e:
+                raise RetrievalError(f"检索失败: {e}") from e
+
+            # 4. 生成回答
+            if search_context.search_type.value == "faq_only":
+                answer = search_context.faq_results[0].answer
+                sources = [{
+                    "type": "faq",
+                    "question": search_context.faq_results[0].question,
+                    "confidence": search_context.faq_results[0].similarity
+                }]
+            else:
+                try:
+                    gen_result = await self.response_gen.agenerate(
+                        query=query,
+                        faq_results=search_context.faq_results,
+                        doc_results=search_context.doc_results,
+                        history_messages=history_messages,
+                    )
+                    answer = gen_result.answer
+                    citations = gen_result.citations
+                except (LLMError, LLMUnavailableError) as e:
+                    raise GenerationError(f"LLM 生成失败: {e}") from e
+
+                if not sources:
+                    for r in search_context.faq_results[:3]:
+                        sources.append({
+                            "type": "faq",
+                            "question": r.question,
+                            "confidence": r.similarity
+                        })
+                    for r in search_context.doc_results[:3]:
+                        sources.append({
+                            "type": "doc",
+                            "source": r.doc_name,
+                            "page": r.doc_page
+                        })
+
+            # 5. 保存历史（同步 DB → 线程池，保存失败不影响返回）
+            try:
+                await asyncio.to_thread(self._save_history, "human", query)
+                await asyncio.to_thread(self._save_history, "ai", answer)
+            except DatabaseError as e:
+                logger.warning("[ChatEngine] achat 主流程保存历史失败: %s", e)
+
+        except DatabaseError as e:
+            logger.error("[ChatEngine] 数据库错误: %s", e)
+            error_code = "DATABASE_ERROR"
+            answer = "系统内部错误（数据库），请稍后再试。"
+        except RetrievalError as e:
+            logger.error("[ChatEngine] 检索错误，降级到纯 LLM: %s", e)
+            error_code = "RETRIEVAL_FAILED"
+            try:
+                history = await asyncio.to_thread(self._load_history)
+                history_messages = self._history_to_messages(history)
+                answer = await asyncio.to_thread(
+                    self.response_gen.generate_pure_llm, query, history_messages
+                )
+                search_type = "pure_llm_fallback"
+            except (LLMError, LLMUnavailableError) as e2:
+                logger.error("[ChatEngine] 纯 LLM 兜底也失败: %s", e2)
+                error_code = "LLM_FAILED"
+                answer = "抱歉，服务暂时不可用，请稍后再试。"
+        except GenerationError as e:
+            logger.error("[ChatEngine] 生成错误，尝试 FAQ 兜底: %s", e)
+            error_code = "GENERATION_FAILED"
+            if search_context and search_context.faq_results:
+                answer = search_context.faq_results[0].answer
+                sources = [{
+                    "type": "faq",
+                    "question": search_context.faq_results[0].question,
+                    "confidence": search_context.faq_results[0].similarity
+                }]
+                search_type = "faq_fallback"
+            else:
+                answer = "抱歉，生成回答时出错了，请稍后再试。"
+        except Exception as e:
+            logger.exception("[ChatEngine] 未预期错误: %s", e)
+            error_code = "UNKNOWN_ERROR"
+            answer = "抱歉，系统出现未知错误，请稍后再试。"
+        finally:
+            latency_ms = (time.perf_counter() - t0) * 1000
+            if error_code and answer:
+                try:
+                    await asyncio.to_thread(self._save_history, "human", query)
+                    await asyncio.to_thread(self._save_history, "ai", answer)
+                except Exception as e:
+                    logger.warning("[ChatEngine] achat finally 保存历史失败: %s", e)
+
+            logger.info(
+                "[ChatEngine] achat | session=%s | type=%s | faq_hits=%d | doc_hits=%d | "
+                "confidence=%.3f | error=%s | latency=%.1fms",
+                self.session_id,
+                search_type,
+                len(search_context.faq_results) if search_context else 0,
+                len(search_context.doc_results) if search_context else 0,
+                confidence,
+                error_code,
+                latency_ms,
+            )
 
         return {
             "answer": answer,
             "sources": sources,
-            "citations": citations,  # 【P0: 引用溯源】
+            "citations": citations,
             "search_type": search_type,
             "confidence": confidence,
             "session_id": self.session_id,
@@ -477,7 +635,7 @@ class ChatEngine:
         try:
             search_context = self.search_router.search(rewritten_query)
         except Exception as e:
-            logger.error("[ChatEngine] stream 检索失败，降级到纯 LLM: %s", e)
+            logger.error("[ChatEngine] stream 检索失败，将使用空上下文继续: %s", e)
 
         chunks = []
         try:
@@ -501,10 +659,7 @@ class ChatEngine:
                     yield "\n[系统提示：生成服务暂时不可用]"
         finally:
             full_answer = "".join(chunks)
-            # 【P0: 引用溯源】解析引用标记（仅用于日志记录，流式接口不返回结构）
-            citations = self.response_gen.extract_citations(full_answer)
-            if citations:
-                logger.info("[ChatEngine] stream citations: %s", [c["id"] for c in citations])
+            # 流式场景下不单独提取 citations（避免引入状态耦合）
             try:
                 self._save_history("human", query)
                 self._save_history("ai", full_answer)
@@ -545,7 +700,7 @@ class ChatEngine:
             else:
                 search_context = await asyncio.to_thread(self.search_router.search, rewritten_query)
         except Exception as e:
-            logger.error("[ChatEngine] astream 检索失败，降级到纯 LLM: %s", e)
+            logger.error("[ChatEngine] astream 检索失败，将使用空上下文继续: %s", e)
 
         chunks = []
         try:
@@ -571,10 +726,7 @@ class ChatEngine:
                     yield "\n[系统提示：生成服务暂时不可用]"
         finally:
             full_answer = "".join(chunks)
-            # 【P0: 引用溯源】
-            citations = self.response_gen.extract_citations(full_answer)
-            if citations:
-                logger.info("[ChatEngine] astream citations: %s", [c["id"] for c in citations])
+            # 流式场景下不单独提取 citations（避免引入状态耦合）
             try:
                 await asyncio.to_thread(self._save_history, "human", query)
                 await asyncio.to_thread(self._save_history, "ai", full_answer)

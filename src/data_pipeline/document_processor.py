@@ -24,6 +24,9 @@ from langchain_text_splitters import (
 )
 from langchain_core.documents import Document
 
+# EPUB → Markdown 解析器（原生实现，无额外依赖）
+from src.data_pipeline.epub_parser import parse_epub_to_markdown
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,15 +45,41 @@ class DocumentProcessor:
         """
         加载文档
         
+        支持格式：PDF、TXT、DOCX、EPUB（自动转为 Markdown）
+        
         Args:
             file_path: 文件路径
             
         Returns:
-            文档列表
+            文档列表（EPUB 返回单文档，包含完整 Markdown 内容）
         """
         file_ext = Path(file_path).suffix.lower()
         
         try:
+            # EPUB 特殊处理：解析为 Markdown
+            if file_ext == '.epub':
+                md_text, quality = parse_epub_to_markdown(file_path)
+                if not quality.is_valid:
+                    logger.error(f"EPUB 解析失败: {file_path}, 原因: {quality.reason}")
+                    return []
+                
+                doc = Document(
+                    page_content=md_text,
+                    metadata={
+                        "source": file_path,
+                        "doc_name": Path(file_path).stem,
+                        "format": "epub",
+                        "total_chars": quality.total_chars,
+                        "chinese_ratio": f"{quality.chinese_ratio:.1%}",
+                    }
+                )
+                logger.info(
+                    f"成功解析 EPUB: {file_path}, "
+                    f"{quality.total_chars}字符, {quality.chapter_count}章节"
+                )
+                return [doc]
+            
+            # 其他格式用 LangChain Loader
             if file_ext == '.pdf':
                 loader = PyPDFLoader(file_path)
             elif file_ext == '.txt':

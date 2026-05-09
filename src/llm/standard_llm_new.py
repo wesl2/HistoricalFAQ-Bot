@@ -220,22 +220,56 @@ class StandardLLM:
         cls,
         messages: Union[str, List[BaseMessage]],
         mode: Optional[str] = None,
+        fallback_mode: Optional[str] = None,
         **kwargs,
     ) -> AIMessage:
-        llm = cls.create(mode)
+        """同步调用（带自动降级）"""
+        mode = mode or LLM_CONFIG["default_mode"]
         messages = cls._normalize_messages(messages)
-        return llm.invoke(messages, **kwargs)
+        try:
+            llm = cls.create(mode)
+            return llm.invoke(messages, **kwargs)
+        except Exception as e:
+            fb = fallback_mode or cls._FALLBACK_CHAIN.get(mode)
+            if fb:
+                logger.warning(
+                    "[LLM] mode=%s 同步调用失败（%s: %s），降级到 %s",
+                    mode, type(e).__name__, e, fb,
+                )
+                try:
+                    llm = cls.create(fb)
+                    return llm.invoke(messages, **kwargs)
+                except Exception as e2:
+                    raise LLMUnavailableError(
+                        f"主模型 {mode} 和降级模型 {fb} 均不可用"
+                    ) from e2
+            raise
 
     @classmethod
     def stream(
         cls,
         messages: Union[str, List[BaseMessage]],
         mode: Optional[str] = None,
+        fallback_mode: Optional[str] = None,
         **kwargs,
     ):
-        llm = cls.create(mode)
+        """同步流式（带自动降级）"""
+        mode = mode or LLM_CONFIG["default_mode"]
         messages = cls._normalize_messages(messages)
-        yield from llm.stream(messages, **kwargs)
+        try:
+            llm = cls.create(mode)
+            yield from llm.stream(messages, **kwargs)
+        except Exception as e:
+            fb = fallback_mode or cls._FALLBACK_CHAIN.get(mode)
+            if fb:
+                logger.warning(
+                    "[LLM] mode=%s 同步流式失败，降级到 %s",
+                    mode, fb,
+                )
+                llm = cls.create(fb)
+                yield from llm.stream(messages, **kwargs)
+            else:
+                raise
 
     # -----------------------------------------------------------------------
     # 核心异步调用（带限流 + 重试 + 自动降级）
