@@ -1,4 +1,4 @@
-# Historical FAQ Bot
+# Historical Chat Bot
 
 基于 RAG 架构的历史文献智能问答系统。上传 EPUB 历史文献，AI 基于文献内容生成回答，并附带可溯源的引用来源。
 
@@ -60,6 +60,7 @@ HistoricalFAQ-Bot/
 │   ├── rag/              # RAG 链与回调
 │   ├── retrieval/        # 检索系统 (BM25、向量、混合、RRF、SearchRouter)
 │   ├── tools/            # 工具函数
+│   ├── monitoring/       # 可观测性（Langfuse 追踪预留）
 │   └── vectorstore/      # PostgreSQL 连接池与数据访问
 ├── config/               # 配置文件 (数据库、模型、检索参数)
 ├── data/
@@ -67,7 +68,7 @@ HistoricalFAQ-Bot/
 │   ├── processed/        # 处理后数据
 │   ├── qa_pairs/         # QA 对（已弃用，全部走 RAG）
 │   └── finetune/         # 微调数据
-├── scripts/              # 数据入库脚本 (ingest_documents.py)
+├── scripts/              # 数据入库与评测脚本 (ingest_documents.py, eval_ragas.py)
 ├── prompts/              # Prompt 模板 (RAG、多查询、对话)
 ├── logs/                 # 运行日志
 ├── frontend.html         # 前端界面（单文件，零构建）
@@ -220,6 +221,16 @@ docker-compose logs -f api
 3. **依赖注入** — `FAQRetriever`/`DocRetriever` 通过构造函数接收 `embedding_fn`，避免循环依赖
 4. **连接池** — `psycopg2.pool.ThreadedConnectionPool(min=1, max=10)`，同步操作通过 `asyncio.to_thread()` 隔离
 5. **限流保护** — `asyncio.Semaphore` 限制 LLM 并发，防止打爆 API
+
+## 路线图 / 预留功能
+
+以下功能已预留接口和脚本位置，欢迎贡献实现：
+
+| 功能 | 路径 | 说明 |
+|------|------|------|
+| **vLLM 本地推理** | `src/llm/vllm_engine.py` | 包装 vLLM 实现本地 Qwen 高并发推理，替代现有本地模式，支持 Continuous Batching 与多卡并行 |
+| **Langfuse 可观测性** | `src/monitoring/langfuse_tracker.py` | 集成 Langfuse 追踪检索→生成的全链路，覆盖延迟、Token 消耗、文档召回质量、用户评分反馈 |
+| **RAGAS 自动评测** | `scripts/eval_ragas.py` | 基于 RAGAS 框架评测 faithfulness、answer_relevancy、context_recall 等指标，生成 HTML 评测报告 |
 
 ## 常见问题
 

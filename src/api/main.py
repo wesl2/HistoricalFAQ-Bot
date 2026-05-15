@@ -108,7 +108,7 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 
 app = FastAPI(
-    title="Historical FAQ Bot API",
+    title="Historical Chat Bot API",
     description="基于 RAG 架构的历史人物问答系统（PDR语义切分 + BM25混合检索 + 引用校验）",
     version="3.0.0",
     lifespan=lifespan,
@@ -336,7 +336,7 @@ async def health_check():
 
     return HealthResponse(
         status=overall,
-        service="Historical FAQ Bot API",
+        service="Historical Chat Bot API",
         version="3.0.0",
         checks=checks,
         features=features,
@@ -347,7 +347,7 @@ async def health_check():
 async def get_info():
     """获取服务基本信息"""
     return {
-        "name": "Historical FAQ Bot",
+        "name": "Historical Chat Bot",
         "version": "3.0.0",
         "description": "基于 RAG 架构的历史人物问答系统",
         "stack": {

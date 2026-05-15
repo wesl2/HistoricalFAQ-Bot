@@ -1,4 +1,4 @@
-# Historical FAQ Bot 服务启动指南
+# Historical Chat Bot 服务启动指南
 
 ## 一、快速启动（开发调试）
 
@@ -56,7 +56,7 @@ tail -f logs/api.log
 
 ```ini
 [Unit]
-Description=Historical FAQ Bot API
+Description=Historical Chat Bot API
 After=network.target postgresql.service
 
 [Service]
