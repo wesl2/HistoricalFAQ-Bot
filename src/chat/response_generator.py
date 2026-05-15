@@ -203,9 +203,10 @@ class ResponseGenerator:
         try:
             resp = StandardLLM.invoke(messages, mode=self.llm_mode)
             answer = resp.content
-            answer, citations, _ = self._sanitize_citations(answer, source_map)
-            # 清理 LLM 自己生成的引用来源块，再追加标准化的 footer
+            # 【修复】先清理 LLM 自发生成的 footer，再从正文中提取引用
+            # 避免 footer 中的虚假引用混入 citations
             answer = self._strip_llm_citation_footer(answer)
+            answer, citations, _ = self._sanitize_citations(answer, source_map)
             answer, footer, id_remap = self._format_citation_footer(answer, source_map)
             if footer:
                 answer += footer
@@ -235,9 +236,10 @@ class ResponseGenerator:
         try:
             resp = await StandardLLM.ainvoke(messages, mode=self.llm_mode)
             answer = resp.content
-            answer, citations, _ = self._sanitize_citations(answer, source_map)
-            # 清理 LLM 自己生成的引用来源块，再追加标准化的 footer
+            # 【修复】先清理 LLM 自发生成的 footer，再从正文中提取引用
+            # 避免 footer 中的虚假引用混入 citations
             answer = self._strip_llm_citation_footer(answer)
+            answer, citations, _ = self._sanitize_citations(answer, source_map)
             answer, footer, id_remap = self._format_citation_footer(answer, source_map)
             if footer:
                 answer += footer

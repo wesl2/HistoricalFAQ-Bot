@@ -31,7 +31,8 @@ from src.retrieval.faq_retriever_practice import FAQRetriever
 from src.retrieval.doc_retriever_practice import DocRetriever
 from src.llm.standard_llm_new import LLMError, LLMUnavailableError, StandardLLM
 from src.chat.response_generator import ResponseGenerator
-from src.vectorstore.pg_pool_practice import get_cursor
+from src.vectorstore.pg_pool_practice import get_cursor,get_connection
+from src.embedding.embedding_local_practice import get_embedding as _shared_get_embedding
 from config.pg_config import PG_CHAT_TABLE
 
 
@@ -105,12 +106,13 @@ class ChatEngine:
 
     def __init__(
         self,
-        search_router=None,
-        response_gen=None,
+        search_router: Optional[SearchRouter] = None,
+        response_gen: Optional[ResponseGenerator] = None,
         llm_mode: str = None,
         session_id: str = None,
         history_limit: int = 10,
         llm_timeout: float = DEFAULT_LLM_TIMEOUT,
+        enable_multi_query: bool = None,
     ):
         """
         初始化对话引擎
@@ -122,18 +124,32 @@ class ChatEngine:
             session_id: 会话 ID，用于标识对话，None 则自动生成
             history_limit: 每次加载的历史消息条数（默认 10 条）
             llm_timeout: LLM 调用超时时间（秒，默认 60）
-
+            enable_multi_query: 是否启用多查询扩展          
         TODO 3: 初始化成员变量
           - search_router：没有就调 _default_search_router() 构建默认的
           - response_gen：没有就 new 一个 ResponseGenerator(llm_mode=llm_mode)
           - llm_mode, session_id（没有就用 uuid.uuid4()）, history_limit, llm_timeout
           - 打 info 日志记录初始化参数
         """
-        # TODO: 实现
-        pass
+        self.search_router = search_router or self._default_search_router(enable_multi_query)
+        self.response_gen = response_gen or ResponseGenerator(llm_mode=llm_mode)
+        self.llm_mode = llm_mode
+        self.session_id = session_id or str(uuid.uuid4())
+        self.history_limit = history_limit
+        self.llm_timeout = llm_timeout
+        self.enable_multi_query = enable_multi_query
+        
+        logger.info(
+            "[ChatEngine] 初始化完成 | mode=%s | session=%s | mq=%s | history_limit=%d | llm_timeout=%.0fs",
+            llm_mode or "default",
+            self.session_id,
+            enable_multi_query,
+            history_limit,
+            llm_timeout,
+        )
 
     @staticmethod
-    def _default_search_router():
+    def _default_search_router(enable_multi_query: bool = False) -> SearchRouter:
         """
         构建默认的 SearchRouter（内部组装 FAQ + Doc 检索器）
 
@@ -142,8 +158,14 @@ class ChatEngine:
           - DocRetriever(top_k=10, use_bm25=True, fusion_method="rrf", rrf_k=60)
           - 返回 SearchRouter(faq_retriever=..., doc_retriever=...)
         """
-        # TODO: 实现
-        pass
+        faq_retriever = FAQRetriever(top_k=3)
+        doc_retriever = DocRetriever(top_k=10, 
+                                    use_bm25=True,
+                                    fusion_method="rrf",
+                                    rrf_k=60,
+                                    enable_multi_query=enable_multi_query,
+                                    embedding_fn=_shared_get_embedding)
+        return SearchRouter(faq_retriever=faq_retriever, doc_retriever=doc_retriever)
 
     # -----------------------------------------------------------------------
     # 对话历史读写（SQL 用 psycopg2.sql.Identifier 安全拼接表名）
@@ -165,8 +187,27 @@ class ChatEngine:
           - psycopg2.Error 抛 DatabaseError
           - 其他异常：打 warning 日志，返回空列表
         """
-        # TODO: 实现
-        pass
+        try:
+            with get_cursor() as cursor:
+                query = psycopg2_sql.SQL(
+                    """
+                    SELECT role , content FROM {}
+                    WHERE session_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """
+                ).format(psycopg2_sql.Identifier(PG_CHAT_TABLE))
+                cursor.execute(query, (self.session_id, self.history_limit))
+                rows = cursor.fetchall()
+                history = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+                logger.debug(
+                    "[ChatEngine] 加载历史 | session=%s | 条数=%d",
+                    self.session_id, len(history)
+                )
+                return history
+        except psycopg2.Error as e:
+            # 数据库错误：向上抛 DatabaseError，让上层决定怎么处理
+            raise DatabaseError(f"加载历史失败: {e}") from e
 
     def _save_history(self, role: str, content: str) -> None:
         """
@@ -182,8 +223,17 @@ class ChatEngine:
           - psycopg2.Error 抛 DatabaseError
           - 其他异常：打 warning 日志
         """
-        # TODO: 实现
-        pass
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as cursor:
+                    query = psycopg2_sql.SQL("""
+                    INSERT INTO {} (session_id, role, content)
+                    VALUES (%s, %s, %s)"""                        
+                    ).format(psycopg2_sql.Identifier(PG_CHAT_TABLE))
+                    cursor.execute(query, (self.session_id, role, content))
+        except psycopg2.Error as e:
+            logger.warning(f"保存历史时发生异常: {e}")
+            raise DatabaseError(f"保存历史失败: {e}") from e
 
     def _history_to_messages(self, history: List[Dict[str, str]]) -> List[Any]:
         """
@@ -197,12 +247,18 @@ class ChatEngine:
 
         TODO 7: 遍历 history，role == "human" 转 HumanMessage，role == "ai" 转 AIMessage
         """
-        # TODO: 实现
-        pass
-
-    # -----------------------------------------------------------------------
-    # P0: Query Rewriting（查询改写 / 指代消解）
-    # -----------------------------------------------------------------------
+        messages = []
+        for item in history:
+            role = item.get("role","").lower()
+            content = item.get("content","").lower()
+            if role == "human":
+                messages.append(HumanMessage(content=content))
+            elif role == "ai": 
+                messages.append(AIMessage(content=content))
+        return messages
+        # -----------------------------------------------------------------------
+        # P0: Query Rewriting（查询改写 / 指代消解）
+        # -----------------------------------------------------------------------
 
     def _rewrite_query(self, query: str, history: List[Dict[str, str]]) -> str:
         """
@@ -232,14 +288,30 @@ class ChatEngine:
         TODO 9: 实现异步指代消解
           - 逻辑和 _rewrite_query 一样，但调 StandardLLM.ainvoke()
         """
-        # TODO: 实现
-        pass
-
+        if history is None or len(history) == 0:
+            return query
+        history_text = '\n'.join(
+            [f"{'用户' if h['role'] == 'human' else 'AI'}：{h['content'][:100]}" 
+             for h in history[-3:]]
+        )
+        prompt = f"""请根据以下对话历史，改写当前用户查询，消除指代歧义（如"他/她/它/这/那"等）。
+                    如果当前查询已经明确具体，无需改写，请直接原样返回。
+                    对话历史：
+                    {history_text}
+                    当前查询：{query}
+                    改写后的查询（只输出改写结果，不要解释）："""
+        try:
+            resp = await StandardLLM.ainvoke(prompt, mode=self.llm_mode)
+            rewritten = resp.content.strip()
+            return rewritten if rewritten else query
+        except Exception as e:  # ← 改成 Exception，不是 LLMError
+            logger.warning(f"[ChatEngine] 查询改写失败: {e}")
+            return query
     # -----------------------------------------------------------------------
     # 核心对话方法（同步）
     # -----------------------------------------------------------------------
 
-    def chat(self, query: str) -> Dict[str, Any]:
+    async def achat(self, query: str) -> Dict[str, Any]:
         """
         处理用户查询（标准模式，带 history + 兜底 + 耗时统计）
 
@@ -254,42 +326,42 @@ class ChatEngine:
                 "latency_ms": float,
             }
 
-        TODO 10: 实现完整的 chat 流程（这是核心方法）
-
-        步骤：
-        1. 记时 t0 = time.perf_counter()
-        2. 初始化 error_code = None, answer = "", sources = [], citations = [] 等
-        3. try 块内部：
-             a. 加载历史 + 转 messages
-             b. 【P0: Query Rewriting】调用 _rewrite_query(query, history)
-                消除指代歧义（如"他"→"王洪文"），用改写后的 query 去检索
-             c. 检索：self.search_router.search(rewritten_query)
-                - 失败抛 RetrievalError
-             d. 判断 search_type：
-                - "faq_only"：直接拿第一条 FAQ 的答案，sources 记录 FAQ 信息
-                - 其他：调 self.response_gen.generate(...) 生成回答
-                  - 失败抛 GenerationError
-                  - sources 从 faq_results[:3] 和 doc_results[:3] 组装
-             e. 保存历史（human + ai）——注意保存原始 query，不是改写后的
-        4. except 分层处理：
-             - DatabaseError → error_code = "DATABASE_ERROR", answer = 固定错误提示
-             - RetrievalError → error_code = "RETRIEVAL_FAILED", 降级到纯 LLM
-               调 response_gen.generate_pure_llm(query, history_messages)
-               如果也失败 → error_code = "LLM_FAILED"
-             - GenerationError → error_code = "GENERATION_FAILED", 尝试 FAQ 兜底
-               有 faq_results 就拿第一条，否则固定错误提示
-             - Exception → error_code = "UNKNOWN_ERROR"
-        5. finally：
-             - 计算 latency_ms
-             - 【P0: Citation Tracking】调 response_gen.extract_citations(answer)
-               解析 [1]、[2] 引用标记，返回 citations 列表
-             - 如果出错了，尽量保存 history（human + 错误 answer）
-             - 打 info 日志汇总结果
-        6. return 结构化字典（包含 answer, sources, citations, search_type...）
+        TODO 10: 实现完整的 achat 流程（这是核心方法）
         """
-        # TODO: 实现
-        pass
-
+        t0 = time.perf_counter()
+        error_code = None
+        answer = ""
+        sources = []
+        citations = [] 
+        search_type = "unknown"
+        confidence = 0.0
+        search_context = None
+        try:
+             # 1. 加载历史（同步 DB → 线程池）
+            history = await asyncio.to_thread(self._load_history)
+            history_messages = self._history_to_messages(history)
+            # 2. Query Rewriting（异步版本）
+            rewritten_query = await self._arewrite_query(query, history)
+            
+            # 3. 检索 —— 这里接上 async！
+            try:
+                search_context = await self.search_router.asearch(rewritten_query)
+                search_type = search_context.search_type.value
+                confidence = search_context.confidence
+            except Exception as e:
+                raise RetrievalError(f"检索失败: {e}") from e
+            # 4. 生成回答
+            if search_context.faq_results and not search_context.doc_results:
+                # 只有 FAQ 结果，直接返回 FAQ 答案
+                answer = search_context.faq_results[0].answer
+                sources = [{
+                    "type": "faq",
+                    "question": search_context.faq_results[0].question,
+                    "confidence": search_context.faq_results[0].similarity
+                }]        
+        except DatabaseError as e:
+            error_code = "DATABASE_ERROR"
+            answer = "抱歉，系统遇到数据库问题，无法处理您的请求。请稍后再试。"
     # -----------------------------------------------------------------------
     # 流式（同步）
     # -----------------------------------------------------------------------
@@ -357,8 +429,7 @@ class ChatEngine:
              - asyncio.to_thread(self._save_history, ...) 保存 human + ai
              - 失败打 warning
         """
-        # TODO: 实现
-        pass
+        
 
     # -----------------------------------------------------------------------
     # 工具方法

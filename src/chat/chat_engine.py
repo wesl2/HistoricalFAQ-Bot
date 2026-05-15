@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -287,15 +288,11 @@ class ChatEngine:
         ])
 
         prompt = f"""请根据以下对话历史，改写当前用户查询，消除指代歧义（如"他/她/它/这/那"等）。
-如果当前查询已经明确具体，无需改写，请直接原样返回。
-
-对话历史：
-{history_text}
-
-当前查询：{query}
-
-改写后的查询（只输出改写结果，不要解释）："""
-
+                    如果当前查询已经明确具体，无需改写，请直接原样返回。
+                    对话历史：
+                    {history_text}
+                    当前查询：{query}
+                    改写后的查询（只输出改写结果，不要解释）："""
         try:
             resp = await StandardLLM.ainvoke(prompt, mode=self.llm_mode)
             rewritten = resp.content.strip()
@@ -654,12 +651,41 @@ class ChatEngine:
                     ):
                         yield chunk
                         chunks.append(chunk)
-                except (LLMError, LLMUnavailableError) as e:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
                     logger.error("[ChatEngine] stream LLM 调用失败: %s", e)
-                    yield "\n[系统提示：生成服务暂时不可用]"
+                    error_msg = "\n[系统提示：生成服务暂时不可用]"
+                    yield error_msg
+                    chunks.append(error_msg)
         finally:
             full_answer = "".join(chunks)
-            # 流式场景下不单独提取 citations（避免引入状态耦合）
+            # 【修复】流式结束后做引用后处理，避免跨消息编号累加
+            if search_context and search_context.doc_results:
+                try:
+                    _, source_map = self.response_gen.build_prompt(
+                        query,
+                        search_context.faq_results if search_context else [],
+                        search_context.doc_results,
+                    )
+                    # 【修复】先删 footer，再从正文中提取引用，避免 footer 里的虚假引用混入 citations
+                    answer_clean = self.response_gen._strip_llm_citation_footer(full_answer)
+                    answer_clean, citations, _ = self.response_gen._sanitize_citations(answer_clean, source_map)
+                    answer_final, footer, id_remap = self.response_gen._format_citation_footer(answer_clean, source_map)
+                    if id_remap:
+                        for c in citations:
+                            old_id = c.get("id")
+                            if old_id in id_remap:
+                                c["original_id"] = old_id
+                                c["id"] = id_remap[old_id]
+                    payload = json.dumps({
+                        "answer": answer_final + (footer or ""),
+                        "citations": citations,
+                    }, ensure_ascii=False)
+                    yield f"__CITATIONS__{payload}"
+                except Exception as e:
+                    logger.warning("[ChatEngine] stream 引用后处理失败: %s", e)
+
             try:
                 self._save_history("human", query)
                 self._save_history("ai", full_answer)
@@ -721,12 +747,41 @@ class ChatEngine:
                     async for chunk in _aiter_with_timeout(llm_stream, timeout=self.llm_timeout):
                         yield chunk
                         chunks.append(chunk)
-                except (LLMError, LLMUnavailableError) as e:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
                     logger.error("[ChatEngine] astream LLM 调用失败: %s", e)
-                    yield "\n[系统提示：生成服务暂时不可用]"
+                    error_msg = "\n[系统提示：生成服务暂时不可用]"
+                    yield error_msg
+                    chunks.append(error_msg)
         finally:
             full_answer = "".join(chunks)
-            # 流式场景下不单独提取 citations（避免引入状态耦合）
+            # 【修复】流式结束后做引用后处理，避免跨消息编号累加
+            if search_context and search_context.doc_results:
+                try:
+                    _, source_map = self.response_gen.build_prompt(
+                        query,
+                        search_context.faq_results if search_context else [],
+                        search_context.doc_results,
+                    )
+                    # 【修复】先删 footer，再从正文中提取引用，避免 footer 里的虚假引用混入 citations
+                    answer_clean = self.response_gen._strip_llm_citation_footer(full_answer)
+                    answer_clean, citations, _ = self.response_gen._sanitize_citations(answer_clean, source_map)
+                    answer_final, footer, id_remap = self.response_gen._format_citation_footer(answer_clean, source_map)
+                    if id_remap:
+                        for c in citations:
+                            old_id = c.get("id")
+                            if old_id in id_remap:
+                                c["original_id"] = old_id
+                                c["id"] = id_remap[old_id]
+                    payload = json.dumps({
+                        "answer": answer_final + (footer or ""),
+                        "citations": citations,
+                    }, ensure_ascii=False)
+                    yield f"__CITATIONS__{payload}"
+                except Exception as e:
+                    logger.warning("[ChatEngine] astream 引用后处理失败: %s", e)
+
             try:
                 await asyncio.to_thread(self._save_history, "human", query)
                 await asyncio.to_thread(self._save_history, "ai", full_answer)

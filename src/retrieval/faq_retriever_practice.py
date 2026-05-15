@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 #
 # 提示：使用 NamedTuple 创建，比 dataclass 更轻量，适合不可变数据
 
-# 你的代码：
+# 
 class FAQResult(BaseModel):
     """FAQ 检索结果（带运行时校验）"""
     model_config = ConfigDict(frozen=True)  #  冻结：创建后不可修改字段值

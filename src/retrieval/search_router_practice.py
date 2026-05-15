@@ -132,7 +132,7 @@ class SearchRouter:
         self,
         faq_retriever: FAQRetriever,
         doc_retriever: DocRetriever,
-        high_threshold: float = 0.82,
+        high_threshold: float = 0.85,
         low_threshold: float = 0.62,
         executor: Optional[ThreadPoolExecutor] = None,
     ):
