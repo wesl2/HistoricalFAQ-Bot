@@ -1,52 +1,80 @@
 # Historical FAQ Bot
 
-基于RAG架构的历史人物问答系统，结合了王洪文QA微调项目和FAQ项目。
+基于 RAG 架构的历史文献智能问答系统。上传 EPUB 历史文献，AI 基于文献内容生成回答，并附带可溯源的引用来源。
 
-## 项目功能
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-green)
+![License](https://img.shields.io/badge/License-MIT-yellow)
 
-- **FAQ检索**：快速匹配常见问题
-- **文档检索(RAG)**：基于文档内容回答问题
-- **混合检索**：结合FAQ和文档结果
-- **本地/API LLM支持**：支持本地模型和API模型
-- **FastAPI后端**：提供RESTful API接口
-- **Web前端**：用户友好的交互界面
-- **容器化部署**：支持Docker部署
+## 核心功能
+
+- **📚 RAG 文档检索** — 基于 BM25 + 向量混合检索，RRF 融合排序，从入库文献中精准召回相关内容
+- **🔗 引用溯源与校验** — 每条 AI 回答底部附带可折叠的引用来源面板，点击 `[n]` 高亮对应文献片段，引用编号经一致性校验
+- **⚡ 流式输出** — SSE 流式传输，首 token 响应快，打字机效果逐字呈现
+- **📤 EPUB 上传入库** — 用户可直接上传 EPUB 文献，自动解析、语义切分、向量化入库，即刻可检索
+- **💬 对话历史持久化** — 基于 UUID 的会话管理，对话记录存储于 PostgreSQL，支持历史会话回看与删除
+- **🧠 Query Rewriting** — 自动指代消解（如"他"→"唐太宗"），多轮对话上下文连贯
+- **🎨 单文件前端** — Tailwind CSS + 原生 JavaScript，零构建依赖，侧边栏/底部输入区均支持拖拽调整尺寸
+
+## 技术架构
+
+```
+┌─────────────┐      HTTP/SSE       ┌─────────────────────────────┐
+│  frontend   │ ◄─────────────────► │  FastAPI (Uvicorn)          │
+│  (单文件)    │                     │  - ChatEngine               │
+└─────────────┘                     │  - ResponseGenerator        │
+                                    │  - SearchRouter             │
+                                    └─────────────┬───────────────┘
+                                                  │
+                    ┌─────────────────────────────┼─────────────────────────────┐
+                    ▼                             ▼                             ▼
+            ┌──────────────┐           ┌──────────────────┐           ┌─────────────┐
+            │  PostgreSQL  │           │   DeepSeek API   │           │   BGE-M3    │
+            │  + pgvector  │           │   (LLM)          │           │  (Embedding)│
+            └──────────────┘           └──────────────────┘           └─────────────┘
+```
 
 ## 技术栈
 
-- **后端**：FastAPI
-- **前端**：HTML5 + Tailwind CSS + JavaScript
-- **向量数据库**：PostgreSQL + pgvector
-- **嵌入模型**：BGE-M3（支持微调）
-- **重排序模型**：BCE-Reranker
-- **LLM**：本地Qwen + API双模架构
-- **部署**：Docker + docker-compose
+| 层级 | 技术 |
+|------|------|
+| **后端** | FastAPI + Python 3.10+ |
+| **前端** | HTML5 + Tailwind CSS (CDN) + JavaScript（单文件 `frontend.html`） |
+| **数据库** | PostgreSQL 14+ + pgvector 扩展 |
+| **嵌入模型** | BGE-M3（1024 维，支持中英文混合） |
+| **LLM** | DeepSeek API（支持本地 Qwen / API 双模式切换） |
+| **检索** | BM25 全文检索 + 向量相似度检索，RRF 融合排序 |
+| **文档处理** | PDR 语义切分、EPUB 解析 |
+| **部署** | Docker / Uvicorn / systemd / screen |
 
 ## 项目结构
 
 ```
 HistoricalFAQ-Bot/
-├── src/             # 核心代码
-│   ├── api/         # FastAPI后端
-│   ├── chat/        # 对话引擎
-│   ├── data_pipeline/ # 数据处理管道
-│   ├── embedding/   # 嵌入模型
-│   ├── llm/         # 语言模型
-│   └── retrieval/   # 检索系统
-├── config/          # 配置文件
-├── data/            # 数据目录
-│   ├── finetune/    # 微调数据
-│   ├── processed/   # 处理后数据
-│   ├── qa_pairs/    # QA对
-│   └── raw/         # 原始数据
-├── scripts/         # 脚本
-├── models/          # 模型目录
-├── logs/            # 日志目录
-├── frontend.html    # 前端界面
-├── Dockerfile       # Docker构建文件
-├── docker-compose.yml # Docker Compose配置
-├── requirements.txt # 依赖文件
-└── README.md        # 项目文档
+├── src/
+│   ├── api/              # FastAPI 服务入口 (main.py)
+│   ├── chat/             # 对话引擎 (ChatEngine, ResponseGenerator)
+│   ├── data_pipeline/    # 数据处理管道 (PDR 语义切分、EPUB 解析)
+│   ├── embedding/        # BGE-M3 嵌入模型封装
+│   ├── llm/              # LLM 调用层 (本地/API 双模式)
+│   ├── rag/              # RAG 链与回调
+│   ├── retrieval/        # 检索系统 (BM25、向量、混合、RRF、SearchRouter)
+│   ├── tools/            # 工具函数
+│   └── vectorstore/      # PostgreSQL 连接池与数据访问
+├── config/               # 配置文件 (数据库、模型、检索参数)
+├── data/
+│   ├── raw/              # 原始 EPUB 文献
+│   ├── processed/        # 处理后数据
+│   ├── qa_pairs/         # QA 对（已弃用，全部走 RAG）
+│   └── finetune/         # 微调数据
+├── scripts/              # 数据入库脚本 (ingest_documents.py)
+├── prompts/              # Prompt 模板 (RAG、多查询、对话)
+├── logs/                 # 运行日志
+├── frontend.html         # 前端界面（单文件，零构建）
+├── requirements.txt      # Python 依赖
+├── Dockerfile            # Docker 构建
+├── docker-compose.yml    # Docker Compose 配置
+└── service_start.md      # 服务启动指南
 ```
 
 ## 快速开始
@@ -55,147 +83,160 @@ HistoricalFAQ-Bot/
 
 ```bash
 # 克隆项目
-git clone <repository-url>
+git clone https://github.com/wesl2/HistoricalFAQ-Bot.git
 cd HistoricalFAQ-Bot
+
+# 创建虚拟环境（推荐）
+conda create -n RAG python=3.10 -y
+conda activate RAG
 
 # 安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 配置
-
-修改 `config/` 目录下的配置文件，设置模型路径和数据库连接信息。
-
-### 3. 启动服务
-
-#### 方法一：直接运行
+### 2. 配置环境变量
 
 ```bash
-# 启动FastAPI服务
-python -m src.api.main
+# DeepSeek API Key（必填）
+export API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 系统编码（防止中文乱码）
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+
+# LLM 模式：api 或 local（默认 api）
+export LLM_MODE=api
 ```
 
-#### 方法二：Docker部署
+### 3. 初始化数据库
+
+确保 PostgreSQL 已安装 pgvector 扩展，并创建数据库：
 
 ```bash
-# 构建并启动容器
+python scripts/init_db.py
+```
+
+### 4. 启动服务
+
+```bash
+# 开发模式（热重载）
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 生产后台运行（screen）
+screen -dmS faq-bot bash -c 'export API_KEY="..."; uvicorn src.api.main:app --host 0.0.0.0 --port 8000'
+```
+
+详见 [`service_start.md`](./service_start.md)。
+
+### 5. 访问系统
+
+- **前端界面**：http://localhost:8000/frontend.html
+- **API 文档**：http://localhost:8000/docs
+- **健康检查**：http://localhost:8000/api/health
+
+## API 接口
+
+### 标准问答
+
+```http
+POST /api/query
+Content-Type: application/json
+
+{
+  "question": "唐太宗的用人之道有什么特点？",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "history": []
+}
+```
+
+### 流式问答（SSE）
+
+```http
+POST /api/query/stream
+Content-Type: application/json
+
+{
+  "question": "贞观之治的主要措施有哪些？",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "stream": true
+}
+```
+
+### 上传 EPUB 文献
+
+```http
+POST /api/upload
+Content-Type: multipart/form-data
+
+file: <your-epub-file>
+```
+
+### 已入库文档列表
+
+```http
+GET /api/documents
+```
+
+### 健康检查
+
+```http
+GET /api/health
+```
+
+## Docker 部署
+
+```bash
+# 构建并启动（包含 PostgreSQL）
 docker-compose up -d
+
+# 查看日志
+docker-compose logs -f api
 ```
 
-### 4. 访问系统
+## 前端特性
 
-- **API接口**：http://localhost:8000/docs
-- **前端界面**：打开 `frontend.html` 文件
+| 特性 | 说明 |
+|------|------|
+| 会话管理 | 左侧栏显示历史会话，支持新建、切换、删除 |
+| 流式输出 | SSE 实时逐字渲染，带打字机光标 |
+| 引用溯源 | 每条 AI 消息底部 `📚 引用来源 (n)` 折叠面板，含书名、章节、摘要 |
+| EPUB 上传 | 底部上传按钮，进度提示，入库后自动刷新 BM25 索引 |
+| 拖拽调整 | 左侧会话栏横向拖拽（200~400px），底部输入区竖直拖拽（150~500px） |
+| 提示卡片 | 右侧显示使用流程与收录书目，可折叠收起 |
 
-## API接口
+## 数据示例
 
-### 1. 查询接口
+当前已入库文献：
 
-- **URL**：`/api/query`
-- **方法**：POST
-- **请求体**：
-  ```json
-  {
-    "question": "王洪文的生平",
-    "history": []
-  }
-  ```
-- **响应**：
-  ```json
-  {
-    "answer": "王洪文（1935年-1992年），吉林长春人，曾任中共中央副主席...",
-    "sources": [
-      {
-        "type": "faq",
-        "question": "王洪文是谁？",
-        "confidence": 0.95
-      }
-    ],
-    "search_type": "faq_only",
-    "confidence": 0.95
-  }
-  ```
+- 《唐太宗传》(赵克尧、许道勋)
+- 《剑桥中国隋唐史：589-906 年》(费正清 等)
 
-### 2. 健康检查
+> 支持用户上传更多 EPUB 历史文献扩展知识库。
 
-- **URL**：`/api/health`
-- **方法**：GET
-- **响应**：
-  ```json
-  {
-    "status": "healthy",
-    "service": "Historical FAQ Bot API"
-  }
-  ```
+## 核心设计亮点
 
-### 3. 服务信息
-
-- **URL**：`/api/info`
-- **方法**：GET
-- **响应**：
-  ```json
-  {
-    "name": "Historical FAQ Bot",
-    "version": "1.0.0",
-    "description": "基于RAG架构的历史人物问答系统",
-    "features": ["FAQ检索", "文档检索(RAG)", "混合检索", "本地/API LLM支持"]
-  }
-  ```
-
-## 模型配置
-
-### 1. 嵌入模型
-
-- **默认路径**：`/root/autodl-tmp/models/bge-m3-finetuned-wang`
-- **支持模型**：BGE-M3（原始或微调）
-
-### 2. 重排序模型
-
-- **默认路径**：`/root/autodl-tmp/models/maidalun/bce-reranker-base_v1`
-
-### 3. LLM模型
-
-- **本地模式**：`/root/autodl-tmp/models/qwen/Qwen1.5-7B-Chat`
-- **API模式**：支持DeepSeek、OpenAI、Claude等
-
-## 数据准备
-
-1. 将原始文档放入 `data/raw/` 目录
-2. 运行数据处理脚本生成QA对
-3. 微调嵌入模型（可选）
-
-## 性能优化
-
-- **批量处理**：调整批处理大小提高效率
-- **缓存**：启用模型缓存减少加载时间
-- **硬件加速**：使用GPU加速模型推理
-- **索引优化**：为向量字段创建索引
-
-## 部署建议
-
-- **生产环境**：使用Docker部署，设置具体的CORS域名
-- **监控**：添加日志监控和性能指标
-- **备份**：定期备份数据库和模型
+1. **引用编号重映射** — `_format_citation_footer()` 确保每条回答的引用编号从 `[1]` 开始，避免跨消息混乱
+2. **异常分层映射** — `chat_engine.py` catch 所有异常返回 `error_code`；`main.py` 映射为 HTTP 状态码；全局处理器兜底
+3. **依赖注入** — `FAQRetriever`/`DocRetriever` 通过构造函数接收 `embedding_fn`，避免循环依赖
+4. **连接池** — `psycopg2.pool.ThreadedConnectionPool(min=1, max=10)`，同步操作通过 `asyncio.to_thread()` 隔离
+5. **限流保护** — `asyncio.Semaphore` 限制 LLM 并发，防止打爆 API
 
 ## 常见问题
 
-### 1. 模型加载失败
+### Q1: 模型加载失败？
+检查 `API_KEY` 环境变量是否设置正确，或模型路径是否存在于本地模式。
 
-检查模型路径是否正确，确保模型文件存在。
+### Q2: 数据库连接失败？
+确保 PostgreSQL 服务运行且已启用 pgvector 扩展，检查 `config/pg_config.py` 中的连接参数。
 
-### 2. 数据库连接失败
+### Q3: 中文乱码？
+```bash
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+```
 
-检查PostgreSQL服务是否运行，连接参数是否正确。
-
-### 3. 响应速度慢
-
-- 检查硬件资源是否充足
-- 调整批处理大小和缓存设置
-- 考虑使用更轻量的模型
-
-## 贡献
-
-欢迎提交Issue和Pull Request！
+### Q4: 如何生产部署？
+购买带公网 IP 的云服务器，Nginx 反向代理 + HTTPS，systemd 或 Docker 持久化运行。详见 `service_start.md`。
 
 ## 许可证
 
